@@ -162,8 +162,8 @@ export class LoggingFile {
 }
 
 class DiscordBridgeConfigGhosts {
-    public nickPattern: string = ":nick";
-    public usernamePattern: string = ":username";
+    public nickPattern: string = ":nick [Discord]";
+    public usernamePattern: string = ":username [Discord]";
 }
 
 export class DiscordBridgeConfigMetrics {

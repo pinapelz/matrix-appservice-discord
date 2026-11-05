@@ -247,11 +247,14 @@ export class UserSyncroniser {
             id: discordUser.id + mxidExtra,
             mxUserId: `@_discord_${discordUser.id}${mxidExtra}:${this.config.bridge.domain}`,
         });
-        const displayName = (msg?.member?.nickname || Util.ApplyPatternString(this.config.ghosts.usernamePattern, {
+        let displayName = (msg?.member?.nickname || Util.ApplyPatternString(this.config.ghosts.usernamePattern, {
             id: discordUser.id,
             tag: discordUser.discriminator,
             username: discordUser.username,
-        })).replace(/#0$/, "");
+        })).replace(/#0(\s*\[Discord\])?$/, "$1");
+        if (!displayName.endsWith("[Discord]")) {
+            displayName = `${displayName} [Discord]`;
+        }
         // Determine if the user exists.
         const remoteId = discordUser.id + mxidExtra;
         const remoteUser = await this.userStore.getRemoteUser(remoteId);
@@ -289,12 +292,15 @@ export class UserSyncroniser {
     public async GetUserStateForGuildMember(
         newMember: GuildMember,
     ): Promise<IGuildMemberState> {
-        const name = Util.ApplyPatternString(this.config.ghosts.nickPattern, {
+        let name = Util.ApplyPatternString(this.config.ghosts.nickPattern, {
             id: newMember.user.id,
             nick: newMember.displayName,
             tag: newMember.user.discriminator,
             username: newMember.user.username,
-        }).replace(/#0$/, "");
+        }).replace(/#0(\s*\[Discord\])?$/, "$1");
+        if (!name.endsWith("[Discord]")) {
+            name = `${name} [Discord]`;
+        }
         const guildState: IGuildMemberState = Object.assign({}, DEFAULT_GUILD_STATE, {
             bot: newMember.user.bot,
             displayColor: newMember.displayColor,
@@ -324,7 +330,7 @@ export class UserSyncroniser {
         }
         const guildState: IGuildMemberState = Object.assign({}, DEFAULT_GUILD_STATE, {
             bot: user.bot,
-            displayName: user.username,
+            displayName: user.username.endsWith("[Discord]") ? user.username : `${user.username} [Discord]`,
             id: user.id + mxidExtra,
             mxUserId: `@_discord_${user.id}${mxidExtra}:${this.config.bridge.domain}`,
             roles: [],

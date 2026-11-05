@@ -578,7 +578,12 @@ export class MatrixEventProcessor {
                 }
             }
         }
-        if (!avatarUrl && sender.endsWith(":tmspk.net")) {
+        const isTeamSpeak = /:([^:]*\.)?tmspk\.net(:[0-9]+)?$/i.test(sender);
+        const platformTag = isTeamSpeak ? " [TeamSpeak]" : " [Matrix]";
+        if (!displayName.endsWith(platformTag)) {
+            displayName = `${displayName.substring(0, MAX_NAME_LENGTH - platformTag.length)}${platformTag}`;
+        }
+        if (!avatarUrl && isTeamSpeak) {
             avatarUrl = TEAMSPEAK_FALLBACK_AVATAR_URL;
         }
         embed.setAuthor(

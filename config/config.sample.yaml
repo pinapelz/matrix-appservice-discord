@@ -112,9 +112,9 @@ limits:
     # roomCount: 20
 ghosts:
     # Pattern for the ghosts nick, available is :nick, :username, :tag and :id
-    nickPattern: ":nick"
+    nickPattern: ":nick [Discord]"
     # Pattern for the ghosts username, available is :username, :tag and :id
-    usernamePattern: ":username"
+    usernamePattern: ":username [Discord]"
 # Prometheus-compatible metrics endpoint
 metrics:
     enable: false
