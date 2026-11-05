@@ -488,13 +488,12 @@ export class MatrixEventProcessor {
             } catch (ignored) {}
         }
 
-        if (profile.displayname) {
-            this.mxUserProfileCache.set(`${roomId}:${userId}`, profile);
-        } else {
+        if (!profile.displayname) {
             // Fallback to localpart if no display name could be resolved
             const split = userId.split(":");
             profile.displayname = split[0].substring(1);
         }
+        this.mxUserProfileCache.set(`${roomId}:${userId}`, profile);
 
         return profile;
     }
