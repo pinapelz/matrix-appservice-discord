@@ -34,8 +34,8 @@ import { TimedCache } from "./structures/timedcache";
 const log = new Log("MatrixEventProcessor");
 
 const MaxFileSize = 8000000;
-const MIN_NAME_LENGTH = 2;
-const MAX_NAME_LENGTH = 32;
+const MIN_NAME_LENGTH = 1;
+const MAX_NAME_LENGTH = 80;
 const DISCORD_AVATAR_WIDTH = 128;
 const DISCORD_AVATAR_HEIGHT = 128;
 const AGE_LIMIT = 900000; // 15 * 60 * 1000
@@ -425,40 +425,77 @@ export class MatrixEventProcessor {
 
     private async GetUserProfileForRoom(roomId: string, userId: string) {
         const mxClient = this.bridge.botIntent.underlyingClient;
-        let profile: {displayname: string, avatar_url: string|undefined} | undefined;
-        try {
-            // First try to pull out the room-specific profile from the cache.
-            profile = this.mxUserProfileCache.get(`${roomId}:${userId}`);
-            if (profile) {
-                return profile;
-            }
-            log.verbose(`Profile ${userId}:${roomId} not cached`);
+        let profile: { displayname: string; avatar_url: string | undefined } = {
+            avatar_url: undefined,
+            displayname: "",
+        };
 
-            // Failing that, try fetching the state.
-            profile = await mxClient.getRoomStateEvent(roomId, "m.room.member", userId);
-            if (profile) {
-                this.mxUserProfileCache.set(`${roomId}:${userId}`, profile);
-                return profile;
-            }
-
-            // Try fetching the users profile from the cache
-            profile = this.mxUserProfileCache.get(userId);
-            if (profile) {
-                return profile;
-            }
-
-            // Failing that, try fetching the profile.
-            log.verbose(`Profile ${userId} not cached`);
-            profile = await mxClient.getUserProfile(userId);
-            if (profile) {
-                this.mxUserProfileCache.set(userId, profile);
-                return profile;
-            }
-            log.warn(`User ${userId} has no member state and no profile. That's odd.`);
-        } catch (err) {
-            log.warn(`Trying to fetch member state or profile for ${userId} failed`, err);
+        const cachedRoomProfile = this.mxUserProfileCache.get(`${roomId}:${userId}`);
+        if (cachedRoomProfile && cachedRoomProfile.displayname) {
+            return cachedRoomProfile;
         }
-        return undefined;
+        const cachedUserProfile = this.mxUserProfileCache.get(userId);
+        if (cachedUserProfile && cachedUserProfile.displayname) {
+            return cachedUserProfile;
+        }
+
+        try {
+            const userProfile = await mxClient.getUserProfile(userId);
+            if (userProfile) {
+                profile = {
+                    avatar_url: userProfile.avatar_url,
+                    displayname: userProfile.displayname || "",
+                };
+            }
+        } catch (e) {
+            log.warn(`Global profile lookup failed for ${userId}, attempting local room state fallback:`, e);
+            try {
+                const memberState = await mxClient.getRoomStateEvent(
+                    roomId,
+                    "m.room.member",
+                    userId,
+                );
+                if (memberState) {
+                    if (memberState.displayname) {
+                        profile.displayname = memberState.displayname;
+                    }
+                    if (memberState.avatar_url) {
+                        profile.avatar_url = memberState.avatar_url;
+                    }
+                }
+            } catch (stateErr) {
+                log.warn(`Failed to fetch room member state for ${userId}:`, stateErr);
+            }
+        }
+
+        // If global profile returned empty displayname, check room state before giving up
+        if (!profile.displayname) {
+            try {
+                const memberState = await mxClient.getRoomStateEvent(
+                    roomId,
+                    "m.room.member",
+                    userId,
+                );
+                if (memberState) {
+                    if (memberState.displayname) {
+                        profile.displayname = memberState.displayname;
+                    }
+                    if (!profile.avatar_url && memberState.avatar_url) {
+                        profile.avatar_url = memberState.avatar_url;
+                    }
+                }
+            } catch (ignored) {}
+        }
+
+        if (profile.displayname) {
+            this.mxUserProfileCache.set(`${roomId}:${userId}`, profile);
+        } else {
+            // Fallback to localpart if no display name could be resolved
+            const split = userId.split(":");
+            profile.displayname = split[0].substring(1);
+        }
+
+        return profile;
     }
 
     private async sendReadReceipt(event: IMatrixEvent) {

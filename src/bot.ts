@@ -622,11 +622,20 @@ export class DiscordBot {
             } else if (hook) {
                 MetricPeg.get.remoteCall("hook.send");
                 const embeds = this.prepareEmbedSetWebhook(embedSet);
+                // Enforce Discord webhook username limits (1-80 chars, no 'clyde' or 'discord')
+                let cleanUsername = (embed!.author!.name || "TeamSpeak User")
+                    .replace(/discord|clyde/gi, "")
+                    .trim();
+
+                if (cleanUsername.length === 0) {
+                    cleanUsername = "TeamSpeak User";
+                }
+                cleanUsername = cleanUsername.slice(0, 80);
+
                 msg = await hook.send(embed.description, {
-                    avatarURL: embed!.author!.iconURL,
                     embeds,
                     files: opts.files,
-                    username: embed!.author!.name,
+                    username: cleanUsername,
                 });
             } else {
                 opts.embed = this.prepareEmbedSetBot(embedSet);

@@ -1,0 +1,10 @@
+services:
+  matrix-appservice-discord:
+    build: .
+    container_name: matrix-appservice-discord
+    restart: unless-stopped
+    ports:
+      - "9005:9005"
+    volumes:
+      - ./data:/data
+      - ./config.yaml:/data/config.yaml:ro

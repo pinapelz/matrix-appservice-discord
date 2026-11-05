@@ -47,6 +47,7 @@ jspm_packages
 
 config.yaml
 discord-registration.yaml
+/data/
 
 # Ignore TS output
 build

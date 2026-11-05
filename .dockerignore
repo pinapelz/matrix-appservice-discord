@@ -12,3 +12,6 @@ README.md
 test
 docs
 config.yaml
+data
+*.log
+
