@@ -100,6 +100,9 @@ export class UserSyncroniser {
         const userState = await this.GetUserUpdateState(discordUser, isWebhook, msg);
         try {
             await this.ApplyStateToProfile(userState);
+            if (msg && msg.member && (userState.displayName !== null || userState.avatarUrl !== null || userState.removeAvatar)) {
+                await this.OnUpdateGuildMember(msg.member, false, false);
+            }
         } catch (e) {
             log.error("Failed to update user's profile", e);
         }
@@ -291,7 +294,7 @@ export class UserSyncroniser {
             nick: newMember.displayName,
             tag: newMember.user.discriminator,
             username: newMember.user.username,
-        });
+        }).replace(/#0$/, "");
         const guildState: IGuildMemberState = Object.assign({}, DEFAULT_GUILD_STATE, {
             bot: newMember.user.bot,
             displayColor: newMember.displayColor,
