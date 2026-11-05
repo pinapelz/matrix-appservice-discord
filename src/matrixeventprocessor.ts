@@ -38,6 +38,7 @@ const MIN_NAME_LENGTH = 1;
 const MAX_NAME_LENGTH = 80;
 const DISCORD_AVATAR_WIDTH = 128;
 const DISCORD_AVATAR_HEIGHT = 128;
+const TEAMSPEAK_FALLBACK_AVATAR_URL = "https://yena.pinapelz.com/jigumi/TS_Stacked_BlueLight.png";
 const AGE_LIMIT = 900000; // 15 * 60 * 1000
 const PROFILE_CACHE_LIFETIME = 900000;
 
@@ -559,13 +560,27 @@ export class MatrixEventProcessor {
             }
 
             if (profile.avatar_url) {
-                avatarUrl = this.bridge.botClient.mxcToHttpThumbnail(
-                    profile.avatar_url,
-                    DISCORD_AVATAR_WIDTH,
-                    DISCORD_AVATAR_HEIGHT,
-                    "scale",
-                );
+                if (profile.avatar_url.startsWith("mxc://")) {
+                    try {
+                        avatarUrl = this.bridge.botClient.mxcToHttpThumbnail(
+                            profile.avatar_url,
+                            DISCORD_AVATAR_WIDTH,
+                            DISCORD_AVATAR_HEIGHT,
+                            "scale",
+                        );
+                    } catch (err) {
+                        log.warn(`Failed to convert MXC avatar URL for ${sender}:`, err);
+                    }
+                } else if (
+                    profile.avatar_url.startsWith("http://") ||
+                    profile.avatar_url.startsWith("https://")
+                ) {
+                    avatarUrl = profile.avatar_url;
+                }
             }
+        }
+        if (!avatarUrl && sender.endsWith(":tmspk.net")) {
+            avatarUrl = TEAMSPEAK_FALLBACK_AVATAR_URL;
         }
         embed.setAuthor(
             displayName.substring(0, MAX_NAME_LENGTH),

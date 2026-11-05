@@ -244,11 +244,11 @@ export class UserSyncroniser {
             id: discordUser.id + mxidExtra,
             mxUserId: `@_discord_${discordUser.id}${mxidExtra}:${this.config.bridge.domain}`,
         });
-        const displayName = msg?.member?.nickname || Util.ApplyPatternString(this.config.ghosts.usernamePattern, {
+        const displayName = (msg?.member?.nickname || Util.ApplyPatternString(this.config.ghosts.usernamePattern, {
             id: discordUser.id,
             tag: discordUser.discriminator,
             username: discordUser.username,
-        });
+        })).replace(/#0$/, "");
         // Determine if the user exists.
         const remoteId = discordUser.id + mxidExtra;
         const remoteUser = await this.userStore.getRemoteUser(remoteId);

@@ -602,7 +602,6 @@ export class DiscordBot {
                     hook = await chan.createWebhook(
                         "_matrix",
                         {
-                            avatar: MATRIX_ICON_URL,
                             reason: "Matrix Bridge: Allow rich user messages",
                         });
                 }
@@ -633,6 +632,7 @@ export class DiscordBot {
                 cleanUsername = cleanUsername.slice(0, 80);
 
                 msg = await hook.send(embed.description, {
+                    avatarURL: embed!.author!.iconURL,
                     embeds,
                     files: opts.files,
                     username: cleanUsername,

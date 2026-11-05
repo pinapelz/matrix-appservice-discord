@@ -163,7 +163,7 @@ export class LoggingFile {
 
 class DiscordBridgeConfigGhosts {
     public nickPattern: string = ":nick";
-    public usernamePattern: string = ":username#:tag";
+    public usernamePattern: string = ":username";
 }
 
 export class DiscordBridgeConfigMetrics {

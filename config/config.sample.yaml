@@ -114,7 +114,7 @@ ghosts:
     # Pattern for the ghosts nick, available is :nick, :username, :tag and :id
     nickPattern: ":nick"
     # Pattern for the ghosts username, available is :username, :tag and :id
-    usernamePattern: ":username#:tag"
+    usernamePattern: ":username"
 # Prometheus-compatible metrics endpoint
 metrics:
     enable: false
