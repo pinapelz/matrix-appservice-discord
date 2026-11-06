@@ -134,6 +134,13 @@ export class MatrixEventProcessor {
         } else if (event.type === "m.room.redaction" && remoteRoom) {
             await this.discord.ProcessMatrixRedact(event);
             return;
+        } else if (event.type === "m.reaction" && remoteRoom) {
+            try {
+                await this.ProcessReactionEvent(event, remoteRoom.remote!);
+            } catch (err) {
+                log.warn("There was an error processing a matrix reaction event", err);
+            }
+            return;
         } else if (event.type === "m.room.message" || event.type === "m.sticker") {
             log.verbose(`Got ${event.type} event`);
             if (isBotCommand(event)) {
@@ -222,6 +229,63 @@ export class MatrixEventProcessor {
         this.sendReadReceipt(event).catch((ex) => {
             log.verbose("Failed to send read reciept for ", event.event_id, ex);
         });
+    }
+
+    public async ProcessReactionEvent(event: IMatrixEvent, room: RemoteStoreRoom): Promise<void> {
+        if (event.sender === this.bridge.botUserId) {
+            return;
+        }
+        const isTeamSpeak = /:([^:]*\.)?tmspk\.net(:[0-9]+)?$/i.test(event.sender);
+        if (isTeamSpeak) {
+            return;
+        }
+        const relatesTo = event.content?.["m.relates_to"];
+        if (!relatesTo || relatesTo.rel_type !== "m.annotation" || !relatesTo.event_id || !relatesTo.key) {
+            return;
+        }
+        const guildId = room.data.discord_guild!;
+        const channelId = room.data.discord_channel!;
+        const targetEventId = String(relatesTo.event_id);
+        const rawKey = String(relatesTo.key).trim();
+        if (!rawKey) {
+            return;
+        }
+
+        const profile = await this.GetUserProfileForRoom(event.room_id, event.sender);
+        const displayName = profile?.displayname || event.sender;
+
+        let emojiDisplay = rawKey;
+        if (rawKey.startsWith("mxc://")) {
+            try {
+                const emojiDb = await this.discord.GetEmojiByMxc(rawKey);
+                emojiDisplay = `<${emojiDb.Animated ? "a" : ""}:${emojiDb.Name}:${emojiDb.EmojiId}>`;
+            } catch (err) {
+                emojiDisplay = ":emote:";
+            }
+        } else if (/^:[^:\s]+:$/.test(rawKey)) {
+            const cleanName = rawKey.replace(/^:+|:+$/g, "");
+            const lower = cleanName.toLowerCase();
+            try {
+                for (const g of this.discord.GetGuilds()) {
+                    const found = g.emojis?.cache?.find((e) => e.name === cleanName)
+                        || g.emojis?.cache?.find((e) => e.name?.toLowerCase() === lower);
+                    if (found) {
+                        emojiDisplay = `<${found.animated ? "a" : ""}:${found.name}:${found.id}>`;
+                        break;
+                    }
+                }
+            } catch (err) { } // ignore if guilds are unavailable
+        }
+
+        await this.discord.ProcessMatrixReaction(
+            event,
+            guildId,
+            channelId,
+            targetEventId,
+            displayName,
+            rawKey,
+            emojiDisplay,
+        );
     }
 
     public async ProcessStateEvent(event: IMatrixEvent) {

@@ -22,6 +22,7 @@ import { DiscordClientFactory } from "./clientfactory";
 import { DiscordStore } from "./store";
 import { DbEmoji } from "./db/dbdataemoji";
 import { DbEvent } from "./db/dbdataevent";
+import { DbReaction, DbReactionThread } from "./db/dbdatareaction";
 import { DiscordMessageProcessor } from "./discordmessageprocessor";
 import { MatrixEventProcessor, MatrixEventProcessorOpts, IMatrixEventProcessorResult } from "./matrixeventprocessor";
 import { PresenceHandler } from "./presencehandler";
@@ -47,6 +48,8 @@ const CACHE_LIFETIME = 90000;
 const LOTTIE_FORMAT = 3;
 const GIF_FORMAT = 4;
 const STICKER_SIZE = 160;
+const AUTO_ARCHIVE_MINUTES = 60;
+const SUPPRESS_NOTIFICATIONS_FLAG = 4096;
 
 // how often do we retry to connect on startup
 const INITIAL_FALLOFF_SECONDS = 5;
@@ -375,6 +378,70 @@ export class DiscordBot {
                 log.error("Exception thrown while handling \"message\" event", err);
             }
         });
+        client.on("messageReactionAdd", async (reaction: Discord.MessageReaction, user: Discord.User | Discord.PartialUser) => {
+            try {
+                const chanId = reaction.message.channel.id;
+                await this.channelLock.wait(chanId);
+                this.discordMessageQueue[chanId] = (async () => {
+                    await (this.discordMessageQueue[chanId] || Promise.resolve());
+                    try {
+                        await this.OnReactionAdd(reaction, user);
+                    } catch (err) {
+                        log.error("Caught while handling 'messageReactionAdd'", err);
+                    }
+                })();
+            } catch (err) {
+                log.error("Exception thrown while handling \"messageReactionAdd\" event", err);
+            }
+        });
+        client.on("messageReactionRemove", async (reaction: Discord.MessageReaction, user: Discord.User | Discord.PartialUser) => {
+            try {
+                const chanId = reaction.message.channel.id;
+                await this.channelLock.wait(chanId);
+                this.discordMessageQueue[chanId] = (async () => {
+                    await (this.discordMessageQueue[chanId] || Promise.resolve());
+                    try {
+                        await this.OnReactionRemove(reaction, user);
+                    } catch (err) {
+                        log.error("Caught while handling 'messageReactionRemove'", err);
+                    }
+                })();
+            } catch (err) {
+                log.error("Exception thrown while handling \"messageReactionRemove\" event", err);
+            }
+        });
+        client.on("messageReactionRemoveEmoji", async (reaction: Discord.MessageReaction) => {
+            try {
+                const chanId = reaction.message.channel.id;
+                await this.channelLock.wait(chanId);
+                this.discordMessageQueue[chanId] = (async () => {
+                    await (this.discordMessageQueue[chanId] || Promise.resolve());
+                    try {
+                        await this.OnReactionRemoveEmoji(reaction);
+                    } catch (err) {
+                        log.error("Caught while handling 'messageReactionRemoveEmoji'", err);
+                    }
+                })();
+            } catch (err) {
+                log.error("Exception thrown while handling \"messageReactionRemoveEmoji\" event", err);
+            }
+        });
+        client.on("messageReactionRemoveAll", async (msg: Discord.Message | Discord.PartialMessage) => {
+            try {
+                const chanId = msg.channel.id;
+                await this.channelLock.wait(chanId);
+                this.discordMessageQueue[chanId] = (async () => {
+                    await (this.discordMessageQueue[chanId] || Promise.resolve());
+                    try {
+                        await this.OnReactionRemoveAll(msg);
+                    } catch (err) {
+                        log.error("Caught while handling 'messageReactionRemoveAll'", err);
+                    }
+                })();
+            } catch (err) {
+                log.error("Exception thrown while handling \"messageReactionRemoveAll\" event", err);
+            }
+        });
         const jsLog = new Log("discord.js");
 
         client.on("userUpdate", async (_, user) => {
@@ -695,12 +762,88 @@ export class DiscordBot {
         return msg;
     }
 
+    public async ProcessMatrixReaction(
+        event: IMatrixEvent,
+        guildId: string,
+        channelId: string,
+        targetMatrixEventId: string,
+        displayName: string,
+        emojiKey: string,
+        emojiDisplay: string,
+    ) {
+        const storeEvent = await this.store.Get(DbEvent, {
+            matrix_id: `${targetMatrixEventId};${event.room_id}`,
+        });
+        if (!storeEvent || !storeEvent.Result || !storeEvent.Next()) {
+            log.verbose(`Ignoring Matrix reaction for unbridged event ${targetMatrixEventId}`);
+            return;
+        }
+        const discordMsgId = storeEvent.DiscordId;
+        const resolvedChannelId = storeEvent.ChannelId || channelId;
+        const resolvedGuildId = storeEvent.GuildId || guildId;
+
+        const reaction = new DbReaction();
+        reaction.DiscordMsgId = discordMsgId;
+        reaction.RoomId = event.room_id;
+        reaction.Source = "matrix";
+        reaction.UserId = event.sender;
+        reaction.DisplayName = displayName;
+        reaction.EmojiKey = emojiKey;
+        reaction.EmojiDisplay = emojiDisplay;
+        reaction.EmojiMxc = "";
+        reaction.MatrixReactionEventId = event.event_id;
+        await this.store.Insert(reaction);
+
+        await this.UpdateDiscordReactionSummary(
+            discordMsgId,
+            targetMatrixEventId,
+            event.room_id,
+            resolvedChannelId,
+            resolvedGuildId,
+        );
+    }
+
     public async ProcessMatrixRedact(event: IMatrixEvent) {
         if (this.config.bridge.disableDeletionForwarding) {
             return;
         }
         log.info(`Got redact request for ${event.redacts}`);
         log.verbose(`Event:`, event);
+
+        const reactionEvent = await this.store.Get(DbReaction, {
+            matrix_reaction_event_id: event.redacts,
+            room_id: event.room_id,
+        });
+        if (reactionEvent && reactionEvent.Result) {
+            while (reactionEvent.Next()) {
+                await this.store.Delete(reactionEvent);
+                const threadRow = await this.store.Get(DbReactionThread, {
+                    discord_msg_id: reactionEvent.DiscordMsgId,
+                    room_id: event.room_id,
+                });
+                const storeMsgEvent = await this.store.Get(DbEvent, {
+                    discord_id: reactionEvent.DiscordMsgId,
+                });
+                let channelId = threadRow?.ChannelId || "";
+                let guildId = threadRow?.GuildId || "";
+                let matrixMsgId = threadRow?.MatrixMsgId || "";
+                if ((!channelId || !matrixMsgId) && storeMsgEvent && storeMsgEvent.Result && storeMsgEvent.Next()) {
+                    channelId = channelId || storeMsgEvent.ChannelId;
+                    guildId = guildId || storeMsgEvent.GuildId;
+                    matrixMsgId = matrixMsgId || storeMsgEvent.MatrixId.split(";")[0];
+                }
+                if (channelId) {
+                    await this.UpdateDiscordReactionSummary(
+                        reactionEvent.DiscordMsgId,
+                        matrixMsgId,
+                        event.room_id,
+                        channelId,
+                        guildId,
+                    );
+                }
+            }
+            return;
+        }
 
         const storeEvent = await this.store.Get(DbEvent, {matrix_id: `${event.redacts};${event.room_id}`});
 
@@ -1305,6 +1448,437 @@ export class DiscordBot {
                     log.warn(`Failed to delete ${storeEvent.DiscordId}, giving up`);
                 }
             }
+        }
+    }
+
+    private async OnReactionAdd(
+        reaction: Discord.MessageReaction,
+        user: Discord.User | Discord.PartialUser,
+    ) {
+        if (user.id === this.GetBotId()) {
+            return;
+        }
+        const discordMsgId = reaction.message.id;
+        const storeEvent = await this.store.Get(DbEvent, { discord_id: discordMsgId });
+        if (!storeEvent || !storeEvent.Result) {
+            return;
+        }
+
+        let displayName = user.username || "";
+        const guildId = reaction.message.guild?.id;
+        const cachedMember = reaction.message.guild?.members?.resolve(user.id);
+        if (cachedMember?.displayName) {
+            displayName = cachedMember.displayName;
+        } else {
+            const resolved = await this.GetDiscordUserOrMember(user.id, guildId);
+            if (resolved instanceof Discord.GuildMember) {
+                displayName = resolved.displayName;
+            } else if (resolved instanceof Discord.User) {
+                displayName = resolved.username;
+            }
+        }
+        if (!displayName) {
+            displayName = user.id;
+        }
+
+        const emojiId = reaction.emoji.id;
+        const emojiName = reaction.emoji.name || "emote";
+        const emojiKey = emojiId ? `${emojiName}:${emojiId}` : emojiName;
+        const emojiDisplay = emojiId ? `:${emojiName}:` : emojiName;
+        let emojiMxc = "";
+        if (emojiId) {
+            try {
+                emojiMxc = await this.GetEmoji(emojiName, Boolean(reaction.emoji.animated), emojiId);
+            } catch (err) {
+                log.warn(`Failed to upload custom reaction emoji ${emojiName} (${emojiId})`, err);
+            }
+        }
+
+        while (storeEvent.Next()) {
+            const [matrixMsgId, roomId] = storeEvent.MatrixId.split(";");
+            const dbReaction = new DbReaction();
+            dbReaction.DiscordMsgId = discordMsgId;
+            dbReaction.RoomId = roomId;
+            dbReaction.Source = "discord";
+            dbReaction.UserId = user.id;
+            dbReaction.DisplayName = displayName;
+            dbReaction.EmojiKey = emojiKey;
+            dbReaction.EmojiDisplay = emojiDisplay;
+            dbReaction.EmojiMxc = emojiMxc;
+            dbReaction.MatrixReactionEventId = "";
+            await this.store.Insert(dbReaction);
+
+            await this.UpdateMatrixReactionSummary(
+                discordMsgId,
+                matrixMsgId,
+                roomId,
+                storeEvent.ChannelId || reaction.message.channel.id,
+                storeEvent.GuildId || guildId || "",
+            );
+        }
+    }
+
+    private async OnReactionRemove(
+        reaction: Discord.MessageReaction,
+        user: Discord.User | Discord.PartialUser,
+    ) {
+        if (user.id === this.GetBotId()) {
+            return;
+        }
+        const discordMsgId = reaction.message.id;
+        const storeEvent = await this.store.Get(DbEvent, { discord_id: discordMsgId });
+        if (!storeEvent || !storeEvent.Result) {
+            return;
+        }
+        const emojiId = reaction.emoji.id;
+        const emojiName = reaction.emoji.name || "emote";
+        const emojiKey = emojiId ? `${emojiName}:${emojiId}` : emojiName;
+
+        while (storeEvent.Next()) {
+            const [matrixMsgId, roomId] = storeEvent.MatrixId.split(";");
+            const dbReaction = new DbReaction();
+            dbReaction.DiscordMsgId = discordMsgId;
+            dbReaction.RoomId = roomId;
+            dbReaction.Source = "discord";
+            dbReaction.UserId = user.id;
+            dbReaction.EmojiKey = emojiKey;
+            await this.store.Delete(dbReaction);
+
+            await this.UpdateMatrixReactionSummary(
+                discordMsgId,
+                matrixMsgId,
+                roomId,
+                storeEvent.ChannelId || reaction.message.channel.id,
+                storeEvent.GuildId || reaction.message.guild?.id || "",
+            );
+        }
+    }
+
+    private async OnReactionRemoveEmoji(reaction: Discord.MessageReaction) {
+        const discordMsgId = reaction.message.id;
+        const storeEvent = await this.store.Get(DbEvent, { discord_id: discordMsgId });
+        if (!storeEvent || !storeEvent.Result) {
+            return;
+        }
+        const emojiId = reaction.emoji.id;
+        const emojiName = reaction.emoji.name || "emote";
+        const emojiKey = emojiId ? `${emojiName}:${emojiId}` : emojiName;
+
+        while (storeEvent.Next()) {
+            const [matrixMsgId, roomId] = storeEvent.MatrixId.split(";");
+            const dbReaction = new DbReaction();
+            dbReaction.DiscordMsgId = discordMsgId;
+            dbReaction.RoomId = roomId;
+            dbReaction.Source = "discord";
+            dbReaction.UserId = "";
+            dbReaction.EmojiKey = emojiKey;
+            await this.store.Delete(dbReaction);
+
+            await this.UpdateMatrixReactionSummary(
+                discordMsgId,
+                matrixMsgId,
+                roomId,
+                storeEvent.ChannelId || reaction.message.channel.id,
+                storeEvent.GuildId || reaction.message.guild?.id || "",
+            );
+        }
+    }
+
+    private async OnReactionRemoveAll(msg: Discord.Message | Discord.PartialMessage) {
+        const discordMsgId = msg.id;
+        const storeEvent = await this.store.Get(DbEvent, { discord_id: discordMsgId });
+        if (!storeEvent || !storeEvent.Result) {
+            return;
+        }
+        while (storeEvent.Next()) {
+            const [matrixMsgId, roomId] = storeEvent.MatrixId.split(";");
+            const dbReaction = new DbReaction();
+            dbReaction.DiscordMsgId = discordMsgId;
+            dbReaction.RoomId = roomId;
+            dbReaction.Source = "discord";
+            dbReaction.UserId = "";
+            dbReaction.EmojiKey = "";
+            await this.store.Delete(dbReaction);
+
+            await this.UpdateMatrixReactionSummary(
+                discordMsgId,
+                matrixMsgId,
+                roomId,
+                storeEvent.ChannelId || msg.channel.id,
+                storeEvent.GuildId || msg.guild?.id || "",
+            );
+        }
+    }
+
+    private async UpdateMatrixReactionSummary(
+        discordMsgId: string,
+        matrixMsgId: string,
+        roomId: string,
+        channelId: string,
+        guildId: string,
+    ) {
+        const reactions = await this.store.Get(DbReaction, {
+            discord_msg_id: discordMsgId,
+            room_id: roomId,
+            source: "discord",
+        });
+        const grouped = new Map<string, { display: string; mxc: string; users: string[] }>();
+        if (reactions && reactions.Result) {
+            while (reactions.Next()) {
+                let entry = grouped.get(reactions.EmojiKey);
+                if (!entry) {
+                    entry = {
+                        display: reactions.EmojiDisplay,
+                        mxc: reactions.EmojiMxc,
+                        users: [],
+                    };
+                    grouped.set(reactions.EmojiKey, entry);
+                }
+                if (!entry.users.includes(reactions.DisplayName)) {
+                    entry.users.push(reactions.DisplayName);
+                }
+            }
+        }
+
+        const threadRow = await this.store.Get(DbReactionThread, {
+            discord_msg_id: discordMsgId,
+            room_id: roomId,
+        });
+
+        if (grouped.size === 0) {
+            if (threadRow && threadRow.Result && threadRow.MatrixSummaryEventId) {
+                try {
+                    await this.bridge.botIntent.underlyingClient.redactEvent(roomId, threadRow.MatrixSummaryEventId);
+                } catch (err) {
+                    log.warn(`Failed to redact Matrix reaction summary ${threadRow.MatrixSummaryEventId}`, err);
+                }
+                threadRow.MatrixSummaryEventId = "";
+                await this.store.Update(threadRow);
+            }
+            return;
+        }
+
+        const plainLines: string[] = [];
+        const htmlLines: string[] = [];
+        for (const entry of grouped.values()) {
+            plainLines.push(`${entry.display}: ${entry.users.join(", ")}`);
+            const emojiHtml = entry.mxc
+                ? `<img data-mx-emoticon height="24" src="${escapeHtml(entry.mxc)}" alt="${escapeHtml(entry.display)}" title="${escapeHtml(entry.display)}" />`
+                : escapeHtml(entry.display);
+            htmlLines.push(`${emojiHtml}: ${entry.users.map((u) => escapeHtml(u)).join(", ")}`);
+        }
+        const body = plainLines.join("\n");
+        const formattedBody = htmlLines.join("<br/>");
+
+        if (threadRow && threadRow.Result && threadRow.MatrixSummaryEventId) {
+            await this.bridge.botIntent.sendEvent(roomId, {
+                body: `* ${body}`,
+                format: "org.matrix.custom.html",
+                formatted_body: `* ${formattedBody}`,
+                "m.new_content": {
+                    body,
+                    format: "org.matrix.custom.html",
+                    formatted_body: formattedBody,
+                    msgtype: "m.notice",
+                },
+                "m.relates_to": {
+                    event_id: threadRow.MatrixSummaryEventId,
+                    rel_type: "m.replace",
+                },
+                msgtype: "m.notice",
+            });
+            return;
+        }
+
+        const summaryEventId = await this.bridge.botIntent.sendEvent(roomId, {
+            body,
+            format: "org.matrix.custom.html",
+            formatted_body: formattedBody,
+            "m.relates_to": {
+                event_id: matrixMsgId,
+                is_falling_back: true,
+                "m.in_reply_to": {
+                    event_id: matrixMsgId,
+                },
+                rel_type: "m.thread",
+            },
+            msgtype: "m.notice",
+        });
+
+        if (threadRow && threadRow.Result) {
+            threadRow.MatrixSummaryEventId = summaryEventId;
+            await this.store.Update(threadRow);
+        } else {
+            const newThread = new DbReactionThread();
+            newThread.DiscordMsgId = discordMsgId;
+            newThread.MatrixMsgId = matrixMsgId;
+            newThread.RoomId = roomId;
+            newThread.ChannelId = channelId;
+            newThread.GuildId = guildId;
+            newThread.MatrixSummaryEventId = summaryEventId;
+            newThread.DiscordThreadId = "";
+            newThread.DiscordSummaryMsgId = "";
+            await this.store.Insert(newThread);
+        }
+    }
+
+    private async UpdateDiscordReactionSummary(
+        discordMsgId: string,
+        matrixMsgId: string,
+        roomId: string,
+        channelId: string,
+        guildId: string,
+    ) {
+        const reactions = await this.store.Get(DbReaction, {
+            discord_msg_id: discordMsgId,
+            room_id: roomId,
+            source: "matrix",
+        });
+        const grouped = new Map<string, { display: string; users: string[] }>();
+        if (reactions && reactions.Result) {
+            while (reactions.Next()) {
+                let entry = grouped.get(reactions.EmojiKey);
+                if (!entry) {
+                    entry = {
+                        display: reactions.EmojiDisplay,
+                        users: [],
+                    };
+                    grouped.set(reactions.EmojiKey, entry);
+                }
+                if (!entry.users.includes(reactions.DisplayName)) {
+                    entry.users.push(reactions.DisplayName);
+                }
+            }
+        }
+
+        const threadRow = await this.store.Get(DbReactionThread, {
+            discord_msg_id: discordMsgId,
+            room_id: roomId,
+        });
+        const botToken = this.config.auth.botToken;
+
+        if (grouped.size === 0) {
+            if (threadRow && threadRow.Result && threadRow.DiscordThreadId) {
+                try {
+                    await Util.DiscordApiRequest("DELETE", `/channels/${threadRow.DiscordThreadId}`, botToken);
+                } catch (err) {
+                    log.warn(`Failed to delete Discord reaction thread ${threadRow.DiscordThreadId}`, err);
+                }
+                threadRow.DiscordThreadId = "";
+                threadRow.DiscordSummaryMsgId = "";
+                await this.store.Update(threadRow);
+            }
+            return;
+        }
+
+        const lines: string[] = [];
+        for (const entry of grouped.values()) {
+            lines.push(`${entry.display}: ${entry.users.join(", ")}`);
+        }
+        const summaryContent = lines.join("\n");
+
+        if (threadRow && threadRow.Result && threadRow.DiscordThreadId && threadRow.DiscordSummaryMsgId) {
+            try {
+                // Unarchive briefly so the summary message can be edited
+                await Util.DiscordApiRequest(
+                    "PATCH",
+                    `/channels/${threadRow.DiscordThreadId}`,
+                    botToken,
+                    { archived: false },
+                );
+                await Util.DiscordApiRequest(
+                    "PATCH",
+                    `/channels/${threadRow.DiscordThreadId}/messages/${threadRow.DiscordSummaryMsgId}`,
+                    botToken,
+                    {
+                        allowed_mentions: { parse: [] },
+                        content: summaryContent,
+                    },
+                );
+                // Archive immediately so the thread is hidden from the channel sidebar
+                await Util.DiscordApiRequest(
+                    "PATCH",
+                    `/channels/${threadRow.DiscordThreadId}`,
+                    botToken,
+                    {
+                        archived: true,
+                        auto_archive_duration: AUTO_ARCHIVE_MINUTES,
+                    },
+                );
+                return;
+            } catch (err) {
+                log.warn(`Failed to update Discord reaction summary in thread ${threadRow.DiscordThreadId}`, err);
+            }
+        }
+
+        try {
+            let threadId = "";
+            try {
+                const threadRes = await Util.DiscordApiRequest(
+                    "POST",
+                    `/channels/${channelId}/messages/${discordMsgId}/threads`,
+                    botToken,
+                    {
+                        auto_archive_duration: AUTO_ARCHIVE_MINUTES,
+                        name: "Reactions",
+                    },
+                );
+                threadId = threadRes?.id || discordMsgId;
+            } catch (err) {
+                // If a thread was already created for this message, its ID is discordMsgId
+                threadId = discordMsgId;
+                await Util.DiscordApiRequest(
+                    "PATCH",
+                    `/channels/${threadId}`,
+                    botToken,
+                    { archived: false },
+                );
+            }
+
+            const msgRes = await Util.DiscordApiRequest(
+                "POST",
+                `/channels/${threadId}/messages`,
+                botToken,
+                {
+                    allowed_mentions: { parse: [] },
+                    content: summaryContent,
+                    flags: SUPPRESS_NOTIFICATIONS_FLAG,
+                },
+            );
+            const summaryMsgId = msgRes?.id || "";
+            if (summaryMsgId) {
+                this.sentMessages.push(summaryMsgId);
+            }
+
+            // Immediately archive the thread so it does not clutter Discord's channel sidebar
+            await Util.DiscordApiRequest(
+                "PATCH",
+                `/channels/${threadId}`,
+                botToken,
+                {
+                    archived: true,
+                    auto_archive_duration: AUTO_ARCHIVE_MINUTES,
+                },
+            );
+
+            if (threadRow && threadRow.Result) {
+                threadRow.DiscordThreadId = threadId;
+                threadRow.DiscordSummaryMsgId = summaryMsgId;
+                await this.store.Update(threadRow);
+            } else {
+                const newThread = new DbReactionThread();
+                newThread.DiscordMsgId = discordMsgId;
+                newThread.MatrixMsgId = matrixMsgId;
+                newThread.RoomId = roomId;
+                newThread.ChannelId = channelId;
+                newThread.GuildId = guildId;
+                newThread.MatrixSummaryEventId = "";
+                newThread.DiscordThreadId = threadId;
+                newThread.DiscordSummaryMsgId = summaryMsgId;
+                await this.store.Insert(newThread);
+            }
+        } catch (err) {
+            log.warn(`Failed to create Discord reaction thread on message ${discordMsgId}`, err);
         }
     }
 

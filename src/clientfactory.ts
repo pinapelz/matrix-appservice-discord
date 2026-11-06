@@ -42,6 +42,7 @@ export class DiscordClientFactory {
         this.botClient = new DiscordClient({
             fetchAllMembers: this.config.usePrivilegedIntents,
             messageCacheLifetime: 5,
+            partials: ["MESSAGE", "CHANNEL", "REACTION", "USER"],
             ws: {
                 intents: this.config.usePrivilegedIntents ? Intents.ALL : Intents.NON_PRIVILEGED,
             },

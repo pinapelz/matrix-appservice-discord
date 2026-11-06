@@ -22,8 +22,11 @@ import { DiscordBridgeConfig } from "./config";
 import { IMatrixEvent } from "./matrixtypes";
 
 const HTTP_OK = 200;
+const HTTP_NO_CONTENT = 204;
 const HTTP_REDIRECT_CODES = [301, 302, 307, 308];
 const MAX_REDIRECTS = 5;
+const DISCORD_API_HOST = "discord.com";
+const DISCORD_API_PREFIX = "/api/v9";
 
 import { Log } from "./log";
 import { Intent, MatrixClient } from "matrix-bot-sdk";
@@ -114,6 +117,68 @@ export class Util {
                 reject(`Failed to download. ${err}`);
             });
         }) as Promise<IDownloadedFile>;
+    }
+
+    /**
+     * Makes a JSON request against the Discord v9 REST API.
+     */
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    public static async DiscordApiRequest(
+        method: string,
+        apiPath: string,
+        botToken: string,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        body?: Record<string, any>,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ): Promise<any> {
+        return new Promise((resolve, reject) => {
+            const payload = body !== undefined ? Buffer.from(JSON.stringify(body), "utf8") : undefined;
+            const headers: Record<string, string> = {
+                "Authorization": `Bot ${botToken}`,
+                "User-Agent": "DiscordBot (https://github.com/Half-Shot/matrix-appservice-discord, 4.0.0)",
+            };
+            if (payload) {
+                headers["Content-Type"] = "application/json";
+                headers["Content-Length"] = String(payload.byteLength);
+            }
+            const req = https.request(
+                {
+                    headers,
+                    hostname: DISCORD_API_HOST,
+                    method,
+                    path: `${DISCORD_API_PREFIX}${apiPath}`,
+                },
+                (res) => {
+                    let buffer = Buffer.alloc(0);
+                    res.on("data", (d) => {
+                        buffer = Buffer.concat([buffer, d]);
+                    });
+                    res.on("end", () => {
+                        const statusCode = res.statusCode || 0;
+                        if (statusCode < HTTP_OK || statusCode >= 300) {
+                            reject(new Error(`Discord API ${method} ${apiPath} failed (${statusCode}): ${buffer.toString("utf8")}`));
+                            return;
+                        }
+                        if (statusCode === HTTP_NO_CONTENT || buffer.byteLength === 0) {
+                            resolve(null);
+                            return;
+                        }
+                        try {
+                            resolve(JSON.parse(buffer.toString("utf8")));
+                        } catch (err) {
+                            resolve(null);
+                        }
+                    });
+                },
+            );
+            req.on("error", (err) => {
+                reject(err);
+            });
+            if (payload) {
+                req.write(payload);
+            }
+            req.end();
+        });
     }
 
     /**
