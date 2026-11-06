@@ -357,8 +357,23 @@ export class MatrixEventProcessor {
         const isSticker = event.type === "m.sticker" || event.content.msgtype === "m.sticker";
         let size = event.content.info.size || 0;
         const url = this.bridge.botClient.mxcToHttp(event.content.url);
+        const authUrl = url.replace("/_matrix/media/v3/download/", "/_matrix/client/v1/media/download/");
+        const accessToken = (mxClient as unknown as { accessToken?: string })?.accessToken
+            || (this.bridge.botClient as unknown as { accessToken?: string })?.accessToken;
+        const headers: Record<string, string> | undefined = accessToken
+            ? { Authorization: `Bearer ${accessToken}` }
+            : undefined;
         if (size < MaxFileSize) {
-            const downloaded = await Util.DownloadFile(url);
+            let downloaded;
+            try {
+                downloaded = await Util.DownloadFile(authUrl, headers);
+            } catch (err) {
+                if (authUrl !== url) {
+                    downloaded = await Util.DownloadFile(url, headers);
+                } else {
+                    throw err;
+                }
+            }
             const attachment = downloaded.buffer;
             if (!event.content.info.mimetype && downloaded.mimeType) {
                 event.content.info.mimetype = downloaded.mimeType;

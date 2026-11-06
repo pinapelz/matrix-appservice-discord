@@ -22,6 +22,8 @@ import { DiscordBridgeConfig } from "./config";
 import { IMatrixEvent } from "./matrixtypes";
 
 const HTTP_OK = 200;
+const HTTP_REDIRECT_CODES = [301, 302, 307, 308];
+const MAX_REDIRECTS = 5;
 
 import { Log } from "./log";
 import { Intent, MatrixClient } from "matrix-bot-sdk";
@@ -66,16 +68,32 @@ export class Util {
      * downloadFile - This function will take a URL and store the resulting data into
      * a buffer.
      */
-    public static async DownloadFile(url: string): Promise<IDownloadedFile> {
+    public static async DownloadFile(
+        url: string,
+        headers?: Record<string, string>,
+        redirectCount: number = 0,
+    ): Promise<IDownloadedFile> {
         return new Promise((resolve, reject) => {
             let get = http.get;
             if (url.startsWith("https")) {
                 get = https.get;
             }
-            const req = get((url), (res) => {
+            const onResponse = (res: http.IncomingMessage) => {
+                if (
+                    res.statusCode &&
+                    HTTP_REDIRECT_CODES.includes(res.statusCode) &&
+                    res.headers.location &&
+                    redirectCount < MAX_REDIRECTS
+                ) {
+                    res.resume();
+                    const nextUrl = new URL(res.headers.location, url).toString();
+                    Util.DownloadFile(nextUrl, undefined, redirectCount + 1).then(resolve, reject);
+                    return;
+                }
                 let buffer = Buffer.alloc(0);
                 if (res.statusCode !== HTTP_OK) {
                     reject(`Non 200 status code (${res.statusCode})`);
+                    return;
                 }
 
                 res.on("data", (d) => {
@@ -88,7 +106,10 @@ export class Util {
                         mimeType: res.headers["content-type"],
                     });
                 });
-            });
+            };
+            const req = headers && Object.keys(headers).length > 0
+                ? get(url, { headers }, onResponse)
+                : get(url, onResponse);
             req.on("error", (err) => {
                 reject(`Failed to download. ${err}`);
             });
