@@ -68,6 +68,39 @@ export interface IThirdPartyLookup {
     protocol: string;
 }
 
+export interface IDiscordStickerItem {
+    id: string;
+    name: string;
+    // eslint-disable-next-line @typescript-eslint/naming-convention
+    format_type?: number;
+}
+
+interface IRawDiscordMessageData {
+    // eslint-disable-next-line @typescript-eslint/naming-convention
+    sticker_items?: IDiscordStickerItem[];
+    stickers?: IDiscordStickerItem[];
+}
+
+interface IPatchedDiscordMessage extends Discord.Message {
+    stickerItems?: IDiscordStickerItem[];
+    _patch?: (data: IRawDiscordMessageData) => void;
+    __stickerPatched?: boolean;
+}
+
+const messageProto = Discord.Message.prototype as unknown as IPatchedDiscordMessage;
+if (messageProto._patch && !messageProto.__stickerPatched) {
+    const origPatch = messageProto._patch;
+    messageProto._patch = function(this: IPatchedDiscordMessage, data: IRawDiscordMessageData) {
+        origPatch.call(this, data);
+        if (data && ("sticker_items" in data || "stickers" in data)) {
+            this.stickerItems = data.sticker_items || data.stickers || [];
+        } else if (!Array.isArray(this.stickerItems)) {
+            this.stickerItems = [];
+        }
+    };
+    messageProto.__stickerPatched = true;
+}
+
 class DiscordBridgeBlocker extends BridgeBlocker {
     constructor(userLimit: number, private bridge: DiscordBot) {
         super(userLimit);
@@ -1098,11 +1131,12 @@ export class DiscordBot {
                             evt.GuildId = msg.guild.id;
                         }
                         await this.store.Insert(evt);
-                        this.userActivity.updateUserActivity(intent.userId);
+                        this.userActivity?.updateUserActivity(intent.userId);
                     });
                 });
             }
-            if (!msg.content && msg.embeds.length === 0) {
+            const stickerItems = (msg as IPatchedDiscordMessage).stickerItems || [];
+            if (!msg.content && msg.embeds.length === 0 && stickerItems.length === 0) {
                 return;
             }
             const result = await this.discordMsgProcessor.FormatMessage(msg);

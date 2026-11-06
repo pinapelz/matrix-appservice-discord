@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 import * as Discord from "@mx-puppet/better-discord.js";
-import { DiscordBot } from "./bot";
-import { Log } from "./log";
+import * as escapeHtml from "escape-html";
+import { DiscordBot, IDiscordStickerItem } from "./bot";
 import {
     DiscordMessageParser,
     IDiscordMessageParserOpts,
@@ -24,19 +24,77 @@ import {
     IDiscordMessageParserResult,
 } from "@mx-puppet/matrix-discord-parser";
 
-const log = new Log("DiscordMessageProcessor");
+const MXC_INSERT_REGEX = /\x01emoji\x01(\w+)\x01([01])\x01([0-9]*)\x01/;
+const NAME_MXC_INSERT_REGEX_GROUP = 1;
+const ANIMATED_MXC_INSERT_REGEX_GROUP = 2;
+const ID_MXC_INSERT_REGEX_GROUP = 3;
+const LOTTIE_FORMAT = 3;
+const GIF_FORMAT = 4;
+
+interface IMessageWithStickers extends Discord.Message {
+    stickerItems?: IDiscordStickerItem[];
+}
 
 export class DiscordMessageProcessor {
     private parser: DiscordMessageParser;
     constructor(private domain: string, private bot: DiscordBot) {
         this.parser = new DiscordMessageParser();
+        (this.parser as unknown as {
+            InsertMxcImages: (
+                opts: IDiscordMessageParserOpts,
+                content: string,
+                msg: Discord.Message,
+                html?: boolean,
+            ) => Promise<string>;
+        }).InsertMxcImages = async (_opts, content, _msg, html = false) => {
+            let results = MXC_INSERT_REGEX.exec(content);
+            while (results !== null) {
+                const name = results[NAME_MXC_INSERT_REGEX_GROUP];
+                const animated = results[ANIMATED_MXC_INSERT_REGEX_GROUP] === "1";
+                const id = results[ID_MXC_INSERT_REGEX_GROUP];
+                const ext = animated ? "gif" : "png";
+                const url = `https://cdn.discordapp.com/emojis/${id}.${ext}`;
+                const nameHtml = escapeHtml(name);
+                const replace = html
+                    ? `<a href="${escapeHtml(url)}">:${nameHtml}:</a>`
+                    : `[:${name}:](${url})`;
+                content = content.replace(results[0], replace);
+                results = MXC_INSERT_REGEX.exec(content);
+            }
+            return content;
+        };
     }
 
     public async FormatMessage(msg: Discord.Message): Promise<IDiscordMessageParserResult> {
         const opts = {
             callbacks: this.getParserCallbacks(msg),
         } as IDiscordMessageParserOpts;
-        return await this.parser.FormatMessage(opts, msg);
+        const result = await this.parser.FormatMessage(opts, msg);
+        const stickerItems = (msg as IMessageWithStickers).stickerItems || [];
+        if (stickerItems.length > 0) {
+            const displayName = msg.member?.displayName || msg.author?.username || "User";
+            for (const sticker of stickerItems) {
+                const stickerName = sticker.name || sticker.id;
+                let stickerUrl: string;
+                if (sticker.format_type === LOTTIE_FORMAT) {
+                    stickerUrl = `https://discord.com/stickers/${sticker.id}.json`;
+                } else {
+                    const ext = sticker.format_type === GIF_FORMAT ? "gif" : "png";
+                    stickerUrl = `https://media.discordapp.net/stickers/${sticker.id}.${ext}`;
+                }
+                const plainLine = `${displayName} sent a sticker: [${stickerName}](${stickerUrl})`;
+                const htmlLine = `${escapeHtml(displayName)} sent a sticker: ` +
+                    `<a href="${escapeHtml(stickerUrl)}">${escapeHtml(stickerName)}</a>`;
+                result.body = result.body ? `${result.body}\n${plainLine}` : plainLine;
+                result.formattedBody = result.formattedBody
+                    ? `${result.formattedBody}<br>${htmlLine}`
+                    : htmlLine;
+            }
+            if (!result.msgtype) {
+                result.msgtype = msg.author?.bot ? "m.notice" : "m.text";
+            }
+        }
+        return result;
     }
 
     public async FormatEdit(
@@ -68,13 +126,8 @@ export class DiscordMessageProcessor {
                 };
             },
             getEmoji: async (name: string, animated: boolean, id: string) => {
-                try {
-                    const mxcUrl = await this.bot.GetEmoji(name, animated, id);
-                    return mxcUrl;
-                } catch (ex) {
-                    log.warn(`Could not get emoji ${id} with name ${name}`, ex);
-                }
-                return null;
+                const ext = animated ? "gif" : "png";
+                return `https://cdn.discordapp.com/emojis/${id}.${ext}`;
             },
             getUser: async (id: string) => {
                 const member = msg.guild?.members.resolve(id);

@@ -198,9 +198,14 @@ export class MatrixEventProcessor {
 
         const embedSet = await this.EventToEmbed(event, chan);
         const opts: Discord.MessageOptions = {};
-        const file = await this.HandleAttachment(event, mxClient, roomLookup.canSendEmbeds);
+        let file = await this.HandleAttachment(event, mxClient, roomLookup.canSendEmbeds);
+        if (!file) {
+            file = await this.HandleStandaloneEmoteAttachment(event, embedSet, roomLookup.canSendEmbeds);
+        }
         if (typeof(file) === "string") {
-            embedSet.messageEmbed.description += " " + file;
+            if (file) {
+                embedSet.messageEmbed.description += ` ${file}`;
+            }
         } else if ((file as Discord.FileOptions).name && (file as Discord.FileOptions).attachment) {
             opts.files = [file as Discord.FileOptions];
         } else {
@@ -300,7 +305,7 @@ export class MatrixEventProcessor {
         }
 
         let body: string = "";
-        if (event.type !== "m.sticker") {
+        if (event.type !== "m.sticker" && event.content?.msgtype !== "m.sticker") {
             const content = event.content!["m.new_content"] ? event.content!["m.new_content"] : event.content;
             body = await this.matrixMsgProcessor.FormatMessage(content as IMatrixMessage, channel.guild, params);
         }
@@ -349,11 +354,16 @@ export class MatrixEventProcessor {
             return "";
         }
 
+        const isSticker = event.type === "m.sticker" || event.content.msgtype === "m.sticker";
         let size = event.content.info.size || 0;
-        const name = this.GetFilenameForMediaEvent(event.content);
         const url = this.bridge.botClient.mxcToHttp(event.content.url);
         if (size < MaxFileSize) {
-            const attachment = (await Util.DownloadFile(url)).buffer;
+            const downloaded = await Util.DownloadFile(url);
+            const attachment = downloaded.buffer;
+            if (!event.content.info.mimetype && downloaded.mimeType) {
+                event.content.info.mimetype = downloaded.mimeType;
+            }
+            const name = this.GetFilenameForMediaEvent(event.content, isSticker);
             size = attachment.byteLength;
             if (size < MaxFileSize) {
                 return {
@@ -362,11 +372,59 @@ export class MatrixEventProcessor {
                 } as Discord.FileOptions;
             }
         }
-        if (sendEmbeds && event.content.info.mimetype.split("/")[0] === "image") {
+        const name = this.GetFilenameForMediaEvent(event.content, isSticker);
+        if (sendEmbeds && (isSticker || event.content.info.mimetype.split("/")[0] === "image")) {
             return new Discord.MessageEmbed()
                 .setImage(url);
         }
         return `[${name}](${url})`;
+    }
+
+    public async HandleStandaloneEmoteAttachment(
+        event: IMatrixEvent,
+        embedSet: IMatrixEventProcessorResult,
+        sendEmbeds: boolean = false,
+    ): Promise<string|Discord.FileOptions|Discord.MessageEmbed> {
+        if (!event.content || this.HasAttachment(event)) {
+            return "";
+        }
+        const content = (event.content["m.new_content"] || event.content) as IMatrixMessage;
+        if (!content.formatted_body) {
+            return "";
+        }
+        const withoutReply = content.formatted_body.replace(/^<mx-reply>[\s\S]*?<\/mx-reply>\s*/i, "").trim();
+        const withoutP = withoutReply.replace(/^<p>([\s\S]*?)<\/p>$/i, "$1").trim();
+        const imgMatch = withoutP.match(/^<img\b([^>]*?)\/?>$/i);
+        if (!imgMatch) {
+            return "";
+        }
+        const attrs = imgMatch[1];
+        const srcMatch = attrs.match(/\bsrc=["'](mxc:\/\/[^"']+)["']/i);
+        if (!srcMatch) {
+            return "";
+        }
+        const desc = embedSet.messageEmbed.description || "";
+        if (/^<a?:[^:]+:\d+>(\s*\(<@\d+>\))?$/.test(desc.trim())) {
+            return "";
+        }
+        const mxcUrl = srcMatch[1];
+        const altMatch = attrs.match(/\balt=["']([^"']*)["']/i) || attrs.match(/\btitle=["']([^"']*)["']/i);
+        const emoteName = altMatch ? altMatch[1] : "emote";
+
+        const pingMatch = desc.match(/(\n\(<@\d+>\))$/);
+        embedSet.messageEmbed.setDescription(pingMatch ? pingMatch[1].trim() : "");
+
+        const syntheticEvent: IMatrixEvent = {
+            ...event,
+            content: {
+                body: emoteName,
+                info: { mimetype: "", size: 0 },
+                msgtype: "m.sticker",
+                url: mxcUrl,
+            },
+            type: "m.sticker",
+        };
+        return this.HandleAttachment(syntheticEvent, this.bridge.botClient, sendEmbeds);
     }
 
     public async GetEmbedForReply(
@@ -593,18 +651,28 @@ export class MatrixEventProcessor {
         );
     }
 
-    private GetFilenameForMediaEvent(content: IMatrixEventContent): string {
+    private GetFilenameForMediaEvent(content: IMatrixEventContent, isSticker: boolean = false): string {
         let ext = "";
         try {
-            ext = "." + mime.getExtension(content.info.mimetype);
-        } catch (err) { } // pass, we don't have an extension
-        if (content.body) {
-            if (path.extname(content.body) !== "") {
-                return content.body;
+            const mimeExt = content.info?.mimetype ? mime.getExtension(content.info.mimetype) : null;
+            if (mimeExt) {
+                ext = `.${mimeExt}`;
             }
-            return path.basename(content.body) + ext;
+        } catch (err) { } // pass, we don't have an extension
+        if (!ext && (isSticker || content.msgtype === "m.sticker")) {
+            ext = ".png";
         }
-        return "matrix-media" + ext;
+        if (content.body) {
+            const cleanBody = (isSticker || content.msgtype === "m.sticker")
+                ? content.body.replace(/^:+|:+$/g, "").replace(/[:/\\?%*|"<>]/g, "_")
+                : content.body;
+            const bodyExt = path.extname(cleanBody);
+            if (bodyExt !== "" && mime.getType(bodyExt) !== null) {
+                return cleanBody;
+            }
+            return `${path.basename(cleanBody) || "sticker"}${ext}`;
+        }
+        return `matrix-media${ext}`;
     }
 }
 

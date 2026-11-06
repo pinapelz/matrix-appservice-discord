@@ -47,7 +47,39 @@ export class MatrixMessageProcessor {
         params?: IMatrixMessageProcessorParams,
     ): Promise<string> {
         const opts = this.getParserOpts(msg, guild, params);
-        return this.parser.FormatMessage(opts, msg);
+        const reply = await this.parser.FormatMessage(opts, msg);
+        return reply.replace(/\\:([a-zA-Z0-9_\\]+)\\:/g, (match, rawName: string) => {
+            const cleanName = rawName.replace(/\\_/g, "_");
+            const emoji = this.findEmojiByName(cleanName, guild);
+            if (emoji) {
+                return `<${emoji.animated ? "a" : ""}:${emoji.name}:${emoji.id}>`;
+            }
+            return match;
+        });
+    }
+
+    private findEmojiByName(
+        cleanName: string,
+        guild: Discord.Guild,
+    ): {id: string, animated: boolean, name: string} | null {
+        const lower = cleanName.toLowerCase();
+        let emoji = guild?.emojis?.cache?.find((e) => e.name === cleanName)
+            || guild?.emojis?.cache?.find((e) => e.name?.toLowerCase() === lower)
+            || guild?.emojis?.resolve(cleanName)
+            || null;
+        if (!emoji && this.bot && typeof this.bot.GetGuilds === "function") {
+            try {
+                for (const g of this.bot.GetGuilds()) {
+                    emoji = g.emojis?.cache?.find((e) => e.name === cleanName)
+                        || g.emojis?.cache?.find((e) => e.name?.toLowerCase() === lower)
+                        || null;
+                    if (emoji) {
+                        break;
+                    }
+                }
+            } catch (err) { } // ignore if bot is not connected
+        }
+        return emoji;
     }
 
     private getParserOpts(
@@ -59,6 +91,7 @@ export class MatrixMessageProcessor {
             callbacks: this.getParserCallbacks(msg, guild, params),
             determineCodeLanguage: this.config.bridge.determineCodeLanguage,
             displayname: params ? params.displayname || "" : "",
+            urlShortener: {},
         };
     }
 
@@ -106,15 +139,24 @@ export class MatrixMessageProcessor {
             },
             getEmoji: async (mxc: string, name: string) => {
                 let emoji: {id: string, animated: boolean, name: string} | null = null;
-                try {
-                    const emojiDb = await this.bot.GetEmojiByMxc(mxc);
-                    const id = emojiDb.EmojiId;
-                    emoji = guild.emojis.resolve(id);
-                } catch (e) {
-                    emoji = null;
+                if (mxc) {
+                    try {
+                        const emojiDb = await this.bot.GetEmojiByMxc(mxc);
+                        const id = emojiDb.EmojiId;
+                        emoji = guild.emojis.resolve(id) || {
+                            animated: emojiDb.Animated,
+                            id: emojiDb.EmojiId,
+                            name: emojiDb.Name,
+                        };
+                    } catch (e) {
+                        emoji = null;
+                    }
                 }
-                if (!emoji) {
-                    emoji = guild.emojis.resolve(name);
+                if (!emoji && name) {
+                    const cleanName = name.replace(/^:+|:+$/g, "");
+                    if (cleanName) {
+                        emoji = this.findEmojiByName(cleanName, guild);
+                    }
                 }
                 return emoji;
             },

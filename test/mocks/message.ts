@@ -23,6 +23,7 @@ import { MockCollection } from "./collection";
 
 export class MockMessage {
     public attachments = new MockCollection<string, any>();
+    public stickerItems: any[] = [];
     public embeds: any[] = [];
     public content = "";
     public channel: Discord.TextChannel | undefined;
