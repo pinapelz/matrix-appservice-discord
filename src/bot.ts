@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 import * as Discord from "@mx-puppet/better-discord.js";
+import * as escapeHtml from "escape-html";
 import { IDiscordMessageParserResult } from "@mx-puppet/matrix-discord-parser";
 import { DiscordBridgeConfig } from "./config";
 import { DiscordClientFactory } from "./clientfactory";
@@ -43,6 +44,9 @@ const log = new Log("DiscordBot");
 const MIN_PRESENCE_UPDATE_DELAY = 250;
 const TYPING_TIMEOUT_MS = 30 * 1000;
 const CACHE_LIFETIME = 90000;
+const LOTTIE_FORMAT = 3;
+const GIF_FORMAT = 4;
+const STICKER_SIZE = 160;
 
 // how often do we retry to connect on startup
 const INITIAL_FALLOFF_SECONDS = 5;
@@ -1134,9 +1138,67 @@ export class DiscordBot {
                         this.userActivity?.updateUserActivity(intent.userId);
                     });
                 });
+                const stickerItems = (msg as IPatchedDiscordMessage).stickerItems || [];
+                await Util.AsyncForEach(stickerItems, async (sticker) => {
+                    const stickerName = sticker.name || sticker.id;
+                    if (sticker.format_type === LOTTIE_FORMAT) {
+                        const stickerUrl = `https://discord.com/stickers/${sticker.id}.json`;
+                        await Util.AsyncForEach(rooms, async (room) => {
+                            const eventId = await intent.sendEvent(room, {
+                                body: `[${stickerName}](${stickerUrl})`,
+                                format: "org.matrix.custom.html",
+                                formatted_body: `<a href="${escapeHtml(stickerUrl)}">${escapeHtml(stickerName)}</a>`,
+                                msgtype: msg.author?.bot ? "m.notice" : "m.text",
+                            });
+                            this.lastEventIds[room] = eventId;
+                            const evt = new DbEvent();
+                            evt.MatrixId = `${eventId};${room}`;
+                            evt.DiscordId = msg.id;
+                            evt.ChannelId = msg.channel.id;
+                            if (msg.guild) {
+                                evt.GuildId = msg.guild.id;
+                            }
+                            await this.store.Insert(evt);
+                            this.userActivity?.updateUserActivity(intent.userId);
+                        });
+                        return;
+                    }
+                    const ext = sticker.format_type === GIF_FORMAT ? "gif" : "png";
+                    const stickerUrl = `https://media.discordapp.net/stickers/${sticker.id}.${ext}`;
+                    const content = await Util.DownloadFile(stickerUrl);
+                    const fileMime = content.mimeType || (ext === "gif" ? "image/gif" : "image/png");
+                    const mxcUrl = await intent.underlyingClient.uploadContent(
+                        content.buffer,
+                        fileMime,
+                        `${stickerName}.${ext}`,
+                    );
+                    const info: IMatrixMediaInfo = {
+                        h: STICKER_SIZE,
+                        mimetype: fileMime,
+                        size: content.buffer.byteLength,
+                        w: STICKER_SIZE,
+                    };
+                    await Util.AsyncForEach(rooms, async (room) => {
+                        await intent.ensureRegisteredAndJoined(room);
+                        const eventId = await intent.underlyingClient.sendEvent(room, "m.sticker", {
+                            body: stickerName,
+                            info,
+                            url: mxcUrl,
+                        });
+                        this.lastEventIds[room] = eventId;
+                        const evt = new DbEvent();
+                        evt.MatrixId = `${eventId};${room}`;
+                        evt.DiscordId = msg.id;
+                        evt.ChannelId = msg.channel.id;
+                        if (msg.guild) {
+                            evt.GuildId = msg.guild.id;
+                        }
+                        await this.store.Insert(evt);
+                        this.userActivity?.updateUserActivity(intent.userId);
+                    });
+                });
             }
-            const stickerItems = (msg as IPatchedDiscordMessage).stickerItems || [];
-            if (!msg.content && msg.embeds.length === 0 && stickerItems.length === 0) {
+            if (!msg.content && msg.embeds.length === 0) {
                 return;
             }
             const result = await this.discordMsgProcessor.FormatMessage(msg);
