@@ -86,13 +86,43 @@ interface IRawDiscordMessageData {
     // eslint-disable-next-line @typescript-eslint/naming-convention
     sticker_items?: IDiscordStickerItem[];
     stickers?: IDiscordStickerItem[];
+    type?: number;
+    // eslint-disable-next-line @typescript-eslint/naming-convention
+    message_reference?: {
+        // eslint-disable-next-line @typescript-eslint/naming-convention
+        channel_id?: string;
+        // eslint-disable-next-line @typescript-eslint/naming-convention
+        guild_id?: string;
+        // eslint-disable-next-line @typescript-eslint/naming-convention
+        message_id?: string;
+    };
+    thread?: {
+        id: string;
+        name?: string;
+        // eslint-disable-next-line @typescript-eslint/naming-convention
+        parent_id?: string;
+        type?: number;
+    };
 }
 
 interface IPatchedDiscordMessage extends Discord.Message {
     stickerItems?: IDiscordStickerItem[];
+    rawType?: number;
+    thread?: {
+        id: string;
+        name?: string;
+        // eslint-disable-next-line @typescript-eslint/naming-convention
+        parent_id?: string;
+        type?: number;
+    };
     _patch?: (data: IRawDiscordMessageData) => void;
     __stickerPatched?: boolean;
 }
+
+const DISCORD_MSG_TYPE_THREAD_CREATED = 18;
+const DISCORD_MSG_TYPE_REPLY = 19;
+const DISCORD_MSG_TYPE_THREAD_STARTER = 21;
+const THREAD_CHANNEL_TYPES = new Set([10, 11, 12]);
 
 const messageProto = Discord.Message.prototype as unknown as IPatchedDiscordMessage;
 if (messageProto._patch && !messageProto.__stickerPatched) {
@@ -104,8 +134,61 @@ if (messageProto._patch && !messageProto.__stickerPatched) {
         } else if (!Array.isArray(this.stickerItems)) {
             this.stickerItems = [];
         }
+        if (data && typeof data.type === "number") {
+            this.rawType = data.type;
+            if (data.type === DISCORD_MSG_TYPE_REPLY) {
+                (this as any).type = "REPLY";
+                this.system = false;
+            }
+        }
+        if (data && data.message_reference) {
+            this.reference = {
+                channelID: data.message_reference.channel_id || (this.channel ? this.channel.id : ""),
+                guildID: data.message_reference.guild_id || (this.guild ? this.guild.id : ""),
+                messageID: data.message_reference.message_id || null,
+            };
+        }
+        if (data && data.thread) {
+            this.thread = data.thread;
+        }
     };
     messageProto.__stickerPatched = true;
+}
+
+const channelClass = Discord.Channel as any;
+if (channelClass && typeof channelClass.create === "function" && !channelClass.__threadPatched) {
+    const origChannelCreate = channelClass.create;
+    channelClass.create = function(client: Discord.Client, data: any, guild?: Discord.Guild) {
+        if (data && THREAD_CHANNEL_TYPES.has(data.type)) {
+            const resolvedGuild = guild || (data.guild_id ? client.guilds?.cache?.get(data.guild_id) : undefined);
+            if (resolvedGuild) {
+                const TextChannelClass = Discord.Structures.get("TextChannel");
+                const channel = new TextChannelClass(resolvedGuild, {
+                    ...data,
+                    type: 0,
+                });
+                (channel as any).isThreadChannel = true;
+                (channel as any).threadType = data.type;
+                channel.parentID = data.parent_id || null;
+                return channel;
+            }
+        }
+        return origChannelCreate.call(this, client, data, guild);
+    };
+    channelClass.__threadPatched = true;
+}
+
+const apiMessageProto = (Discord as any).APIMessage?.prototype;
+if (apiMessageProto && typeof apiMessageProto.resolveData === "function" && !apiMessageProto.__replyPatched) {
+    const origResolveData = apiMessageProto.resolveData;
+    apiMessageProto.resolveData = function(this: any) {
+        const res = origResolveData.call(this);
+        if (this.options?.messageReference && this.data) {
+            this.data.message_reference = this.options.messageReference;
+        }
+        return res;
+    };
+    apiMessageProto.__replyPatched = true;
 }
 
 class DiscordBridgeBlocker extends BridgeBlocker {
@@ -136,6 +219,7 @@ export class DiscordBot {
     private _bot: Discord.Client|undefined;
     private sentMessages: string[];
     private lastEventIds: { [channelId: string]: string };
+    private notifiedDiscordThreads: Set<string>;
     private discordMsgProcessor: DiscordMessageProcessor;
     private mxEventProcessor: MatrixEventProcessor;
     private presenceHandler: PresenceHandler;
@@ -190,6 +274,7 @@ export class DiscordBot {
         this.discordMessageQueue = {};
         this.channelLock = new Lock(this.config.limits.discordSendDelay);
         this.lastEventIds = {};
+        this.notifiedDiscordThreads = new Set();
 
         if (!this.adminNotifier && config.bridge.adminMxid) {
             this.adminNotifier = new AdminNotifier(
@@ -479,6 +564,53 @@ export class DiscordBot {
                 }
                 await this.userSync.OnUpdateGuildMember(member);
             } catch (err) { log.error("Exception thrown while handling \"guildMemberUpdate\" event", err); }
+        });
+        client.on("raw" as any, async (packet: any) => {
+            try {
+                if (!packet || !packet.t || !packet.d) {
+                    return;
+                }
+                const channelsMgr = (client as any).channels;
+                if (!channelsMgr || typeof channelsMgr.add !== "function") {
+                    return;
+                }
+                if (packet.t === "GUILD_CREATE" && Array.isArray(packet.d.threads)) {
+                    const guild = client.guilds?.cache?.get(packet.d.id);
+                    for (const thread of packet.d.threads) {
+                        channelsMgr.add(thread, guild);
+                        if (thread.id) {
+                            this.notifiedDiscordThreads.add(thread.id);
+                        }
+                    }
+                } else if (packet.t === "THREAD_CREATE" || packet.t === "THREAD_UPDATE") {
+                    const guild = packet.d.guild_id ? client.guilds?.cache?.get(packet.d.guild_id) : undefined;
+                    channelsMgr.add(packet.d, guild);
+                    if (
+                        packet.t === "THREAD_CREATE" &&
+                        packet.d.owner_id !== client.user?.id &&
+                        packet.d.newly_created !== false
+                    ) {
+                        await this.NotifyDiscordThreadNotBridged(packet.d.id, packet.d.parent_id);
+                    }
+                } else if (packet.t === "THREAD_LIST_SYNC" && Array.isArray(packet.d.threads)) {
+                    const guild = packet.d.guild_id ? client.guilds?.cache?.get(packet.d.guild_id) : undefined;
+                    for (const thread of packet.d.threads) {
+                        channelsMgr.add(thread, guild);
+                    }
+                } else if (
+                    packet.t === "MESSAGE_CREATE" &&
+                    packet.d.channel_id &&
+                    !channelsMgr.cache?.has(packet.d.channel_id) &&
+                    typeof channelsMgr.fetch === "function"
+                ) {
+                    const fetched = await channelsMgr.fetch(packet.d.channel_id);
+                    if (fetched) {
+                        (client as any).actions?.MessageCreate?.handle(packet.d);
+                    }
+                }
+            } catch (err) {
+                log.verbose("Exception while handling raw gateway packet", err);
+            }
         });
         client.on("debug", (msg) => { jsLog.verbose(msg); });
         client.on("error", (msg) => { jsLog.error(msg); });
@@ -1180,6 +1312,99 @@ export class DiscordBot {
         }
     }
 
+    private async FindMatrixEventIdInRoom(discordId: string, room: string): Promise<string | undefined> {
+        if (!discordId || typeof this.store?.Get !== "function") {
+            return undefined;
+        }
+        const storeEvent = await this.store.Get(DbEvent, { discord_id: discordId });
+        if (!storeEvent || !storeEvent.Result) {
+            return undefined;
+        }
+        let fallbackEventId: string | undefined;
+        while (storeEvent.Next()) {
+            const [matrixEventId, eventRoom] = storeEvent.MatrixId.split(";");
+            if (eventRoom === room && matrixEventId) {
+                return matrixEventId;
+            }
+            if (!fallbackEventId && matrixEventId && !eventRoom) {
+                fallbackEventId = matrixEventId;
+            }
+        }
+        return fallbackEventId;
+    }
+
+    private async NotifyDiscordThreadNotBridged(threadId: string, parentChannelId?: string | null): Promise<void> {
+        if (!threadId || this.notifiedDiscordThreads.has(threadId)) {
+            return;
+        }
+        let resolvedParentId = parentChannelId;
+        if (!resolvedParentId) {
+            const cachedChan = (this._bot as any)?.channels?.cache?.get(threadId);
+            resolvedParentId = cachedChan?.parentID || cachedChan?.parent_id;
+        }
+        if (!resolvedParentId) {
+            return;
+        }
+        try {
+            const rooms = await this.channelSync.GetRoomIdsFromChannel({ id: resolvedParentId } as Discord.Channel);
+            if (!rooms || rooms.length === 0) {
+                return;
+            }
+        } catch (err) {
+            return;
+        }
+        this.notifiedDiscordThreads.add(threadId);
+        try {
+            const msgRes = await Util.DiscordApiRequest(
+                "POST",
+                `/channels/${threadId}/messages`,
+                this.config.auth.botToken,
+                {
+                    allowed_mentions: { parse: [] },
+                    content: "WARNING! Threads are not bridged to Matrix.",
+                },
+            );
+            if (msgRes?.id) {
+                this.sentMessages.push(msgRes.id);
+            }
+        } catch (err) {
+            log.warn(`Failed to send thread unsupported notice to Discord thread ${threadId}:`, err);
+        }
+    }
+
+    private async ResolveDiscordMessageRelatesTo(msg: Discord.Message, room: string): Promise<any | undefined> {
+        const refDiscordMsgId = msg.reference?.messageID || undefined;
+        if (refDiscordMsgId) {
+            const replyMatrixId = await this.FindMatrixEventIdInRoom(refDiscordMsgId, room);
+            if (replyMatrixId) {
+                return {
+                    "m.in_reply_to": {
+                        event_id: replyMatrixId,
+                    },
+                };
+            }
+        }
+        return undefined;
+    }
+
+    private async RecordDiscordEventSentToMatrix(
+        msg: Discord.Message,
+        room: string,
+        eventId: string,
+        intentUserId: string,
+    ): Promise<void> {
+        this.lastEventIds[room] = eventId;
+        const evt = new DbEvent();
+        evt.MatrixId = `${eventId};${room}`;
+        evt.DiscordId = msg.id;
+        evt.ChannelId = msg.channel.id;
+        if (msg.guild) {
+            evt.GuildId = msg.guild.id;
+        }
+        await this.store.Insert(evt);
+        this.userActivity?.updateUserActivity(intentUserId);
+    }
+
     private async OnMessage(msg: Discord.Message, editEventId: string = "") {
         const indexOfMsg = this.sentMessages.indexOf(msg.id);
         if (indexOfMsg !== -1) {
@@ -1188,10 +1413,21 @@ export class DiscordBot {
             MetricPeg.get.requestOutcome(msg.id, true, "dropped");
             return; // Skip *our* messages
         }
+        const rawType = (msg as IPatchedDiscordMessage).rawType;
+        if (rawType === DISCORD_MSG_TYPE_THREAD_CREATED || rawType === DISCORD_MSG_TYPE_THREAD_STARTER) {
+            log.verbose(`Ignoring Discord thread system message ${msg.id} (type ${rawType})`);
+            MetricPeg.get.requestOutcome(msg.id, true, "dropped");
+            return;
+        }
         const chan = msg.channel as Discord.TextChannel;
         if (msg.author.id === this.bot.user?.id) {
             // We don't support double bridging.
             log.verbose("Not reflecting bot's own messages");
+            MetricPeg.get.requestOutcome(msg.id, true, "dropped");
+            return;
+        }
+        if ((chan as any).isThreadChannel) {
+            await this.NotifyDiscordThreadNotBridged(chan.id, chan.parentID);
             MetricPeg.get.requestOutcome(msg.id, true, "dropped");
             return;
         }
@@ -1202,7 +1438,6 @@ export class DiscordBot {
             if (webhook && msg.webhookID === webhook.id) {
                 // Filter out our own webhook messages.
                 log.verbose("Not reflecting own webhook messages");
-              // Filter out our own webhook messages.
                 MetricPeg.get.requestOutcome(msg.id, true, "dropped");
                 return;
             }
@@ -1262,23 +1497,19 @@ export class DiscordBot {
                         info.h = attachment.height!;
                     }
                     await Util.AsyncForEach(rooms, async (room) => {
-                        const eventId = await intent.sendEvent(room, {
+                        const relatesTo = await this.ResolveDiscordMessageRelatesTo(msg, room);
+                        const attachmentContent: any = {
                             body: attachment.name || "file",
                             external_url: attachment.url,
                             info,
                             msgtype,
                             url: mxcUrl,
-                        });
-                        this.lastEventIds[room] = eventId;
-                        const evt = new DbEvent();
-                        evt.MatrixId = `${eventId};${room}`;
-                        evt.DiscordId = msg.id;
-                        evt.ChannelId = msg.channel.id;
-                        if (msg.guild) {
-                            evt.GuildId = msg.guild.id;
+                        };
+                        if (relatesTo) {
+                            attachmentContent["m.relates_to"] = relatesTo;
                         }
-                        await this.store.Insert(evt);
-                        this.userActivity?.updateUserActivity(intent.userId);
+                        const eventId = await intent.sendEvent(room, attachmentContent);
+                        await this.RecordDiscordEventSentToMatrix(msg, room, eventId, intent.userId);
                     });
                 });
                 const stickerItems = (msg as IPatchedDiscordMessage).stickerItems || [];
@@ -1287,22 +1518,18 @@ export class DiscordBot {
                     if (sticker.format_type === LOTTIE_FORMAT) {
                         const stickerUrl = `https://discord.com/stickers/${sticker.id}.json`;
                         await Util.AsyncForEach(rooms, async (room) => {
-                            const eventId = await intent.sendEvent(room, {
+                            const relatesTo = await this.ResolveDiscordMessageRelatesTo(msg, room);
+                            const lottieContent: any = {
                                 body: `[${stickerName}](${stickerUrl})`,
                                 format: "org.matrix.custom.html",
                                 formatted_body: `<a href="${escapeHtml(stickerUrl)}">${escapeHtml(stickerName)}</a>`,
                                 msgtype: msg.author?.bot ? "m.notice" : "m.text",
-                            });
-                            this.lastEventIds[room] = eventId;
-                            const evt = new DbEvent();
-                            evt.MatrixId = `${eventId};${room}`;
-                            evt.DiscordId = msg.id;
-                            evt.ChannelId = msg.channel.id;
-                            if (msg.guild) {
-                                evt.GuildId = msg.guild.id;
+                            };
+                            if (relatesTo) {
+                                lottieContent["m.relates_to"] = relatesTo;
                             }
-                            await this.store.Insert(evt);
-                            this.userActivity?.updateUserActivity(intent.userId);
+                            const eventId = await intent.sendEvent(room, lottieContent);
+                            await this.RecordDiscordEventSentToMatrix(msg, room, eventId, intent.userId);
                         });
                         return;
                     }
@@ -1323,21 +1550,17 @@ export class DiscordBot {
                     };
                     await Util.AsyncForEach(rooms, async (room) => {
                         await intent.ensureRegisteredAndJoined(room);
-                        const eventId = await intent.underlyingClient.sendEvent(room, "m.sticker", {
+                        const relatesTo = await this.ResolveDiscordMessageRelatesTo(msg, room);
+                        const stickerContent: any = {
                             body: stickerName,
                             info,
                             url: mxcUrl,
-                        });
-                        this.lastEventIds[room] = eventId;
-                        const evt = new DbEvent();
-                        evt.MatrixId = `${eventId};${room}`;
-                        evt.DiscordId = msg.id;
-                        evt.ChannelId = msg.channel.id;
-                        if (msg.guild) {
-                            evt.GuildId = msg.guild.id;
+                        };
+                        if (relatesTo) {
+                            stickerContent["m.relates_to"] = relatesTo;
                         }
-                        await this.store.Insert(evt);
-                        this.userActivity?.updateUserActivity(intent.userId);
+                        const eventId = await intent.underlyingClient.sendEvent(room, "m.sticker", stickerContent);
+                        await this.RecordDiscordEventSentToMatrix(msg, room, eventId, intent.userId);
                     });
                 });
             }
@@ -1368,19 +1591,15 @@ export class DiscordBot {
                         event_id: editEventId,
                         rel_type: "m.replace",
                     };
+                } else {
+                    const relatesTo = await this.ResolveDiscordMessageRelatesTo(msg, room);
+                    if (relatesTo) {
+                        sendContent["m.relates_to"] = relatesTo;
+                    }
                 }
                 const trySend = async () =>  intent.sendEvent(room, sendContent);
                 const afterSend = async (eventId) => {
-                    this.lastEventIds[room] = eventId;
-                    const evt = new DbEvent();
-                    evt.MatrixId = `${eventId};${room}`;
-                    evt.DiscordId = msg.id;
-                    evt.ChannelId = msg.channel.id;
-                    if (msg.guild) {
-                        evt.GuildId = msg.guild.id;
-                    }
-                    await this.store.Insert(evt);
-                    this.userActivity.updateUserActivity(intent.userId);
+                    await this.RecordDiscordEventSentToMatrix(msg, room, eventId, intent.userId);
                 };
                 let res;
                 try {
@@ -1813,6 +2032,7 @@ export class DiscordBot {
 
         try {
             let threadId = "";
+            this.notifiedDiscordThreads.add(discordMsgId);
             try {
                 const threadRes = await Util.DiscordApiRequest(
                     "POST",
@@ -1834,6 +2054,7 @@ export class DiscordBot {
                     { archived: false },
                 );
             }
+            this.notifiedDiscordThreads.add(threadId);
 
             const msgRes = await Util.DiscordApiRequest(
                 "POST",

@@ -67,7 +67,7 @@ export class ChannelSyncroniser {
     }
 
     public async OnUpdate(channel: Discord.Channel) {
-        if (channel.type !== "text") {
+        if (channel.type !== "text" || (channel as any).isThreadChannel) {
             return; // Not supported for now
         }
         const channelState = await this.GetChannelUpdateState(channel as Discord.TextChannel);
@@ -82,7 +82,7 @@ export class ChannelSyncroniser {
         log.verbose(`Got guild update for guild ${guild.id}`);
         const channelStates: IChannelState[] = [];
         for (const [_, channel] of guild.channels.cache) {
-            if (channel.type !== "text") {
+            if (channel.type !== "text" || (channel as any).isThreadChannel) {
                 continue; // not supported for now
             }
             try {
@@ -120,7 +120,7 @@ export class ChannelSyncroniser {
     }
 
     public async OnDelete(channel: Discord.Channel) {
-        if (channel.type !== "text") {
+        if (channel.type !== "text" || (channel as any).isThreadChannel) {
             log.info(`Channel ${channel.id} was deleted but isn't a text channel, so ignoring.`);
             return;
         }

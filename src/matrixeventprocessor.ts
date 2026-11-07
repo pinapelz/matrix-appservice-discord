@@ -67,6 +67,7 @@ export class MatrixEventProcessor {
     private matrixMsgProcessor: MatrixMessageProcessor;
     private mxCommandHandler: MatrixCommandHandler;
     private mxUserProfileCache: TimedCache<string, {displayname: string, avatar_url: string|undefined}>;
+    private notifiedMatrixThreads: Set<string>;
 
     constructor(opts: MatrixEventProcessorOpts, cm?: MatrixCommandHandler) {
         this.config = opts.config;
@@ -76,6 +77,7 @@ export class MatrixEventProcessor {
         this.store = opts.store;
         this.matrixMsgProcessor = new MatrixMessageProcessor(this.discord, this.config);
         this.mxUserProfileCache = new TimedCache(PROFILE_CACHE_LIFETIME);
+        this.notifiedMatrixThreads = new Set();
         if (cm) {
             this.mxCommandHandler = cm;
         } else {
@@ -187,6 +189,31 @@ export class MatrixEventProcessor {
      * @throws {Unstable.ForeignNetworkError}
      */
     public async ProcessMsgEvent(event: IMatrixEvent, room: RemoteStoreRoom): Promise<void> {
+        const relatesTo = event.content ? event.content["m.relates_to"] : undefined;
+        if (relatesTo && relatesTo.rel_type === "m.thread" && relatesTo.event_id) {
+            const threadKey = `${event.room_id}:${relatesTo.event_id}`;
+            if (!this.notifiedMatrixThreads.has(threadKey)) {
+                this.notifiedMatrixThreads.add(threadKey);
+                try {
+                    await this.bridge.botIntent.sendEvent(event.room_id, {
+                        body: "WARNING! Threads are not bridged to Discord.",
+                        "m.relates_to": {
+                            event_id: relatesTo.event_id,
+                            is_falling_back: true,
+                            "m.in_reply_to": {
+                                event_id: event.event_id || relatesTo.event_id,
+                            },
+                            rel_type: "m.thread",
+                        },
+                        msgtype: "m.notice",
+                    });
+                } catch (err) {
+                    log.warn("Failed to send Matrix thread unsupported notice:", err);
+                }
+            }
+            return;
+        }
+
         const guildId = room.data.discord_guild!;
         const channelId = room.data.discord_channel!;
         const mxClient = this.bridge.botClient;
@@ -195,16 +222,22 @@ export class MatrixEventProcessor {
         const chan = roomLookup.channel;
 
         let editEventId = "";
-        if (event.content && event.content["m.relates_to"] && event.content["m.relates_to"].rel_type === "m.replace") {
-            const editMatrixId = `${event.content["m.relates_to"].event_id};${event.room_id}`;
+        const opts: Discord.MessageOptions = {};
+        if (relatesTo && relatesTo.rel_type === "m.replace") {
+            const editMatrixId = `${relatesTo.event_id};${event.room_id}`;
             const storeEvent = await this.store.Get(DbEvent, {matrix_id: editMatrixId});
             if (storeEvent && storeEvent.Result && storeEvent.Next()) {
                 editEventId = storeEvent.DiscordId;
             }
+        } else if (relatesTo && relatesTo["m.in_reply_to"] && relatesTo["m.in_reply_to"].event_id) {
+            const replyMatrixId = `${relatesTo["m.in_reply_to"].event_id};${event.room_id}`;
+            const replyStoreEvent = await this.store.Get(DbEvent, {matrix_id: replyMatrixId});
+            if (replyStoreEvent && replyStoreEvent.Result && replyStoreEvent.Next()) {
+                (opts as any).messageReference = { message_id: replyStoreEvent.DiscordId };
+            }
         }
 
         const embedSet = await this.EventToEmbed(event, chan);
-        const opts: Discord.MessageOptions = {};
         let file = await this.HandleAttachment(event, mxClient, roomLookup.canSendEmbeds);
         if (!file) {
             file = await this.HandleStandaloneEmoteAttachment(event, embedSet, roomLookup.canSendEmbeds);
@@ -368,10 +401,23 @@ export class MatrixEventProcessor {
             params.displayname = profile.displayname;
         }
 
+        const relatesTo = event.content ? event.content["m.relates_to"] : undefined;
         let body: string = "";
         if (event.type !== "m.sticker" && event.content?.msgtype !== "m.sticker") {
-            const content = event.content!["m.new_content"] ? event.content!["m.new_content"] : event.content;
-            body = await this.matrixMsgProcessor.FormatMessage(content as IMatrixMessage, channel.guild, params);
+            const rawContent = (event.content!["m.new_content"] ? event.content!["m.new_content"] : event.content) as IMatrixMessage;
+            const content: IMatrixMessage = { ...rawContent };
+            if (relatesTo && relatesTo["m.in_reply_to"]) {
+                if (content.formatted_body && !content.format) {
+                    content.format = "org.matrix.custom.html";
+                } else if (
+                    !content.formatted_body &&
+                    typeof content.body === "string" &&
+                    content.body.startsWith("> <@")
+                ) {
+                    content.body = content.body.replace(/^(>.*\r?\n)+\r?\n/, "").trimStart();
+                }
+            }
+            body = await this.matrixMsgProcessor.FormatMessage(content, channel.guild, params);
         }
 
         const messageEmbed = new Discord.MessageEmbed();
@@ -529,7 +575,7 @@ export class MatrixEventProcessor {
             if (!sourceEvent || !sourceEvent.content || !sourceEvent.content.body) {
                 throw Error("No content could be found");
             }
-            const replyEmbed = (await this.EventToEmbed(sourceEvent, channel, true)).messageEmbed;
+            const replyEmbed = (await this.EventToEmbed(sourceEvent, channel, false)).messageEmbed;
 
             // if we reply to a discord member, ping them!
             if (this.bridge.isNamespacedUser(sourceEvent.sender)) {
