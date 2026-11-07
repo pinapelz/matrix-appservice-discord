@@ -46,8 +46,14 @@ export class MatrixMessageProcessor {
         guild: Discord.Guild,
         params?: IMatrixMessageProcessorParams,
     ): Promise<string> {
-        const opts = this.getParserOpts(msg, guild, params);
-        const reply = await this.parser.FormatMessage(opts, msg);
+        const parseMsg: IMatrixMessage = msg.formatted_body
+            ? {
+                ...msg,
+                formatted_body: msg.formatted_body.replace(/<\/p>\s*\r?\n\s*<p(\b|>)/gi, "</p><p$1"),
+            }
+            : msg;
+        const opts = this.getParserOpts(parseMsg, guild, params);
+        const reply = await this.parser.FormatMessage(opts, parseMsg);
         return reply.replace(/\\:([a-zA-Z0-9_\\]+)\\:/g, (match, rawName: string) => {
             const cleanName = rawName.replace(/\\_/g, "_");
             const emoji = this.findEmojiByName(cleanName, guild);
@@ -139,7 +145,7 @@ export class MatrixMessageProcessor {
             },
             getEmoji: async (mxc: string, name: string) => {
                 let emoji: {id: string, animated: boolean, name: string} | null = null;
-                if (mxc) {
+                if (mxc && mxc.startsWith("mxc://")) {
                     try {
                         const emojiDb = await this.bot.GetEmojiByMxc(mxc);
                         const id = emojiDb.EmojiId;
@@ -170,7 +176,7 @@ export class MatrixMessageProcessor {
                 return match[1];
             },
             mxcUrlToHttp: (mxc: string) => {
-                if (params && params.mxClient) {
+                if (params && params.mxClient && mxc.startsWith("mxc://")) {
                     return params.mxClient.mxcToHttp(mxc);
                 }
                 return mxc;

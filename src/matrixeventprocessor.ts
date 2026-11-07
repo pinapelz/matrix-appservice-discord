@@ -466,35 +466,42 @@ export class MatrixEventProcessor {
 
         const isSticker = event.type === "m.sticker" || event.content.msgtype === "m.sticker";
         let size = event.content.info.size || 0;
-        const url = this.bridge.botClient.mxcToHttp(event.content.url);
-        const authUrl = url.replace("/_matrix/media/v3/download/", "/_matrix/client/v1/media/download/");
+        const isMxc = event.content.url.startsWith("mxc://");
+        const url = isMxc ? this.bridge.botClient.mxcToHttp(event.content.url) : event.content.url;
+        const authUrl = isMxc
+            ? url.replace("/_matrix/media/v3/download/", "/_matrix/client/v1/media/download/")
+            : url;
         const accessToken = (mxClient as unknown as { accessToken?: string })?.accessToken
             || (this.bridge.botClient as unknown as { accessToken?: string })?.accessToken;
-        const headers: Record<string, string> | undefined = accessToken
+        const headers: Record<string, string> | undefined = (isMxc && accessToken)
             ? { Authorization: `Bearer ${accessToken}` }
             : undefined;
         if (size < MaxFileSize) {
-            let downloaded;
             try {
-                downloaded = await Util.DownloadFile(authUrl, headers);
-            } catch (err) {
-                if (authUrl !== url) {
-                    downloaded = await Util.DownloadFile(url, headers);
-                } else {
-                    throw err;
+                let downloaded;
+                try {
+                    downloaded = await Util.DownloadFile(authUrl, headers);
+                } catch (err) {
+                    if (authUrl !== url) {
+                        downloaded = await Util.DownloadFile(url, headers);
+                    } else {
+                        throw err;
+                    }
                 }
-            }
-            const attachment = downloaded.buffer;
-            if (!event.content.info.mimetype && downloaded.mimeType) {
-                event.content.info.mimetype = downloaded.mimeType;
-            }
-            const name = this.GetFilenameForMediaEvent(event.content, isSticker);
-            size = attachment.byteLength;
-            if (size < MaxFileSize) {
-                return {
-                    attachment,
-                    name,
-                } as Discord.FileOptions;
+                const attachment = downloaded.buffer;
+                if (!event.content.info.mimetype && downloaded.mimeType) {
+                    event.content.info.mimetype = downloaded.mimeType;
+                }
+                const name = this.GetFilenameForMediaEvent(event.content, isSticker);
+                size = attachment.byteLength;
+                if (size < MaxFileSize) {
+                    return {
+                        attachment,
+                        name,
+                    } as Discord.FileOptions;
+                }
+            } catch (err) {
+                log.warn("Failed to download attachment, falling back to URL:", err);
             }
         }
         const name = this.GetFilenameForMediaEvent(event.content, isSticker);
@@ -519,37 +526,59 @@ export class MatrixEventProcessor {
         }
         const withoutReply = content.formatted_body.replace(/^<mx-reply>[\s\S]*?<\/mx-reply>\s*/i, "").trim();
         const withoutP = withoutReply.replace(/^<p>([\s\S]*?)<\/p>$/i, "$1").trim();
-        const imgMatch = withoutP.match(/^<img\b([^>]*?)\/?>$/i);
+        const standaloneImgMatch = withoutP.match(/^<img\b([^>]*?)\/?>$/i);
+        const inlineImgMatch = !standaloneImgMatch ? withoutReply.match(/<img\b([^>]*?)\/?>/i) : null;
+        const imgMatch = standaloneImgMatch || inlineImgMatch;
         if (!imgMatch) {
             return "";
         }
         const attrs = imgMatch[1];
-        const srcMatch = attrs.match(/\bsrc=["'](mxc:\/\/[^"']+)["']/i);
+        const srcMatch = attrs.match(/\bsrc=["']((?:mxc|https?):\/\/[^"']+)["']/i);
         if (!srcMatch) {
             return "";
         }
         const desc = embedSet.messageEmbed.description || "";
-        if (/^<a?:[^:]+:\d+>(\s*\(<@\d+>\))?$/.test(desc.trim())) {
+        if (standaloneImgMatch && /^<a?:[^:]+:\d+>(\s*\(<@\d+>\))?$/.test(desc.trim())) {
             return "";
         }
-        const mxcUrl = srcMatch[1];
+        const mediaUrl = srcMatch[1];
+        const isMxc = mediaUrl.startsWith("mxc://");
+        const httpUrl = isMxc ? this.bridge.botClient.mxcToHttp(mediaUrl) : mediaUrl;
+        if (inlineImgMatch && !desc.includes(httpUrl)) {
+            return "";
+        }
         const altMatch = attrs.match(/\balt=["']([^"']*)["']/i) || attrs.match(/\btitle=["']([^"']*)["']/i);
-        const emoteName = altMatch ? altMatch[1] : "emote";
-
-        const pingMatch = desc.match(/(\n\(<@\d+>\))$/);
-        embedSet.messageEmbed.setDescription(pingMatch ? pingMatch[1].trim() : "");
+        let mediaName = altMatch ? altMatch[1] : "emote";
+        if (!isMxc) {
+            try {
+                const parsedPath = new URL(mediaUrl).pathname;
+                const base = path.basename(parsedPath);
+                if (base && path.extname(base)) {
+                    mediaName = base;
+                }
+            } catch (err) { }
+        }
 
         const syntheticEvent: IMatrixEvent = {
             ...event,
             content: {
-                body: emoteName,
-                info: { mimetype: "", size: 0 },
-                msgtype: "m.sticker",
-                url: mxcUrl,
+                body: mediaName,
+                info: { mimetype: isMxc ? "" : "image/png", size: 0 },
+                msgtype: standaloneImgMatch ? "m.sticker" : "m.image",
+                url: mediaUrl,
             },
-            type: "m.sticker",
+            type: standaloneImgMatch ? "m.sticker" : "m.room.message",
         };
-        return this.HandleAttachment(syntheticEvent, this.bridge.botClient, sendEmbeds);
+        const result = await this.HandleAttachment(syntheticEvent, this.bridge.botClient, sendEmbeds);
+        if (standaloneImgMatch) {
+            const pingMatch = desc.match(/(\n\(<@\d+>\))$/);
+            embedSet.messageEmbed.setDescription(pingMatch ? pingMatch[1].trim() : "");
+        } else if (result) {
+            const escapedUrl = httpUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            const placeholderRegex = new RegExp(`\\n*\\[[^\\n]*?${escapedUrl}\\s*\\]`, "g");
+            embedSet.messageEmbed.setDescription(desc.replace(placeholderRegex, "").trim());
+        }
+        return result;
     }
 
     public async GetEmbedForReply(
@@ -586,7 +615,10 @@ export class MatrixEventProcessor {
             replyEmbed.setTimestamp(new Date(sourceEvent.origin_server_ts!));
 
             if (this.HasAttachment(sourceEvent)) {
-                const url = this.bridge.botClient.mxcToHttp(sourceEvent.content!.url!);
+                const rawUrl = sourceEvent.content!.url!;
+                const url = rawUrl.startsWith("mxc://")
+                    ? this.bridge.botClient.mxcToHttp(rawUrl)
+                    : rawUrl;
                 if (["m.image", "m.sticker"].includes(sourceEvent.content!.msgtype as string)
                     || sourceEvent.type === "m.sticker") {
                     // we have an image reply
