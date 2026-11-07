@@ -33,7 +33,7 @@ import { TimedCache } from "./structures/timedcache";
 
 const log = new Log("MatrixEventProcessor");
 
-const MaxFileSize = 8000000;
+const MaxFileSize = 20000000;
 const MIN_NAME_LENGTH = 1;
 const MAX_NAME_LENGTH = 80;
 const DISCORD_AVATAR_WIDTH = 128;
@@ -238,25 +238,48 @@ export class MatrixEventProcessor {
         }
 
         const embedSet = await this.EventToEmbed(event, chan);
+        if (this.IsAttachmentBodyJustFilename(event)) {
+            const desc = embedSet.messageEmbed.description || "";
+            const pingMatch = desc.match(/(?:^|\n)(\(<@\d+>\))$/);
+            embedSet.messageEmbed.setDescription(pingMatch ? pingMatch[1] : "");
+        }
         let file = await this.HandleAttachment(event, mxClient, roomLookup.canSendEmbeds);
         if (!file) {
             file = await this.HandleStandaloneEmoteAttachment(event, embedSet, roomLookup.canSendEmbeds);
         }
+        let fallbackAttachmentText = "";
         if (typeof(file) === "string") {
             if (file) {
-                embedSet.messageEmbed.description += ` ${file}`;
+                this.AppendAttachmentText(embedSet, file);
             }
         } else if ((file as Discord.FileOptions).name && (file as Discord.FileOptions).attachment) {
-            opts.files = [file as Discord.FileOptions];
+            const fileOpts = file as Discord.FileOptions;
+            opts.files = [fileOpts];
+            fallbackAttachmentText = this.GetFallbackAttachmentText(event, fileOpts);
         } else {
             embedSet.imageEmbed = file as Discord.MessageEmbed;
         }
 
     // Throws an `Unstable.ForeignNetworkError` when sending the message fails.
-        if (editEventId) {
-            await this.discord.edit(embedSet, opts, roomLookup, event, editEventId);
-        } else {
-            await this.discord.send(embedSet, opts, roomLookup, event);
+        try {
+            if (editEventId) {
+                await this.discord.edit(embedSet, opts, roomLookup, event, editEventId);
+            } else {
+                await this.discord.send(embedSet, opts, roomLookup, event);
+            }
+        } catch (err) {
+            if (opts.files && opts.files.length > 0 && fallbackAttachmentText) {
+                log.warn("Failed to upload attachment to Discord, falling back to link:", err);
+                delete opts.files;
+                this.AppendAttachmentText(embedSet, fallbackAttachmentText);
+                if (editEventId) {
+                    await this.discord.edit(embedSet, opts, roomLookup, event, editEventId);
+                } else {
+                    await this.discord.send(embedSet, opts, roomLookup, event);
+                }
+            } else {
+                throw err;
+            }
         }
         // Don't await this.
         this.sendReadReceipt(event).catch((ex) => {
@@ -476,6 +499,7 @@ export class MatrixEventProcessor {
         const headers: Record<string, string> | undefined = (isMxc && accessToken)
             ? { Authorization: `Bearer ${accessToken}` }
             : undefined;
+        let tooBig = size >= MaxFileSize;
         if (size < MaxFileSize) {
             try {
                 let downloaded;
@@ -495,11 +519,14 @@ export class MatrixEventProcessor {
                 const name = this.GetFilenameForMediaEvent(event.content, isSticker);
                 size = attachment.byteLength;
                 if (size < MaxFileSize) {
-                    return {
+                    const fileOpts = {
                         attachment,
                         name,
-                    } as Discord.FileOptions;
+                    } as Discord.FileOptions & { fallbackUrl?: string };
+                    fileOpts.fallbackUrl = url;
+                    return fileOpts;
                 }
+                tooBig = true;
             } catch (err) {
                 log.warn("Failed to download attachment, falling back to URL:", err);
             }
@@ -508,6 +535,9 @@ export class MatrixEventProcessor {
         if (sendEmbeds && (isSticker || event.content.info.mimetype.split("/")[0] === "image")) {
             return new Discord.MessageEmbed()
                 .setImage(url);
+        }
+        if (tooBig) {
+            return `[${name}](${url}) (${this.FormatFileSize(size)} - too big for Discord)`;
         }
         return `[${name}](${url})`;
     }
@@ -830,6 +860,76 @@ export class MatrixEventProcessor {
             return `${path.basename(cleanBody) || "sticker"}${ext}`;
         }
         return `matrix-media${ext}`;
+    }
+
+    private IsAttachmentBodyJustFilename(event: IMatrixEvent): boolean {
+        if (!event.content || !this.HasAttachment(event)) {
+            return false;
+        }
+        const rawContent = (event.content["m.new_content"]
+            ? event.content["m.new_content"]
+            : event.content) as IMatrixEventContent & { filename?: string };
+        const isSticker = event.type === "m.sticker" || rawContent.msgtype === "m.sticker";
+        if (isSticker) {
+            return true;
+        }
+        const body = typeof rawContent.body === "string" ? rawContent.body.trim() : "";
+        if (!body) {
+            return true;
+        }
+        if (typeof rawContent.filename === "string" && rawContent.filename.trim() !== "") {
+            return body === rawContent.filename.trim();
+        }
+        const generatedName = this.GetFilenameForMediaEvent(rawContent, isSticker);
+        if (body === generatedName) {
+            return true;
+        }
+        const ext = path.extname(generatedName);
+        if (ext && `${body}${ext}` === generatedName) {
+            return true;
+        }
+        return false;
+    }
+
+    private AppendAttachmentText(embedSet: IMatrixEventProcessorResult, text: string): void {
+        if (!text) {
+            return;
+        }
+        const desc = embedSet.messageEmbed.description || "";
+        const pingMatch = desc.match(/^(?:([\s\S]*?)\n)?(\(<@\d+>\))$/);
+        if (pingMatch) {
+            const prefix = pingMatch[1] ? `${pingMatch[1]} ${text}` : text;
+            embedSet.messageEmbed.setDescription(`${prefix}\n${pingMatch[2]}`);
+        } else if (desc) {
+            embedSet.messageEmbed.setDescription(`${desc} ${text}`);
+        } else {
+            embedSet.messageEmbed.setDescription(text);
+        }
+    }
+
+    private GetFallbackAttachmentText(event: IMatrixEvent, fileOpts: Discord.FileOptions): string {
+        const name = fileOpts.name || this.GetFilenameForMediaEvent(event.content || {});
+        const attachment = fileOpts.attachment;
+        const size = Buffer.isBuffer(attachment)
+            ? attachment.byteLength
+            : (event.content?.info?.size || 0);
+        const fallbackUrl = (fileOpts as Discord.FileOptions & { fallbackUrl?: string }).fallbackUrl;
+        let url = fallbackUrl || "";
+        if (!url && event.content?.url) {
+            url = event.content.url.startsWith("mxc://")
+                ? this.bridge.botClient.mxcToHttp(event.content.url)
+                : event.content.url;
+        }
+        const sizeSuffix = `(${this.FormatFileSize(size)} - too big for Discord)`;
+        return url ? `[${name}](${url}) ${sizeSuffix}` : `${name} ${sizeSuffix}`;
+    }
+
+    private FormatFileSize(bytes: number): string {
+        const mb = bytes / (1024 * 1024);
+        if (mb >= 0.01 || bytes === 0) {
+            return `${mb.toFixed(2)} MB`;
+        }
+        return `${(bytes / 1024).toFixed(2)} KB`;
     }
 }
 

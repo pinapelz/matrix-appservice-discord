@@ -757,7 +757,12 @@ export class DiscordBot {
         const chan = roomLookup.channel;
         const botUser = roomLookup.botUser;
         const embed = embedSet.messageEmbed;
-        const oldMsg = await chan.messages.fetch(editEventId);
+        let oldMsg: Discord.Message | undefined;
+        try {
+            oldMsg = await chan.messages.fetch(editEventId);
+        } catch (err) {
+            oldMsg = undefined;
+        }
         if (!oldMsg) {
             // old message not found, just sending this normally
             await this.send(embedSet, opts, roomLookup, event);
@@ -806,6 +811,9 @@ export class DiscordBot {
             embedSet.messageEmbed.description = `[Edit](${link}): ${embedSet.messageEmbed.description}`;
             await this.send(embedSet, opts, roomLookup, event);
         } catch (err) {
+            if (opts.files && opts.files.length > 0) {
+                throw err;
+            }
             // throw wrapError(err, Unstable.ForeignNetworkError, "Couldn't edit message");
             log.warn(`Failed to edit message ${event.event_id}`);
             log.verbose(err);
@@ -887,6 +895,10 @@ export class DiscordBot {
                 await storePromise;
             }
         } catch (err) {
+            this.channelLock.release(chan.id);
+            if (opts.files && opts.files.length > 0) {
+                throw err;
+            }
             // throw wrapError(err, Unstable.ForeignNetworkError, "Couldn't send message");
             log.warn(`Failed to send message ${event.event_id}`);
             log.verbose(err);
