@@ -1478,7 +1478,11 @@ export class DiscordBot {
                 }
             }
             if (rooms && rooms.length > 0) {
-                const members = await Util.GetMatrixMembersForRooms(this.bridge.botIntent, rooms);
+                const members = await Util.GetMatrixMembersForRooms(
+                    this.bridge.botIntent,
+                    rooms,
+                    this.bridge.botUserId ? [this.bridge.botUserId] : [],
+                );
                 const filtered = members.filter((m) => {
                     if (!query) {
                         return true;
@@ -1578,7 +1582,11 @@ export class DiscordBot {
             return;
         }
 
-        const members = await Util.GetMatrixMembersForRooms(this.bridge.botIntent, rooms);
+        const members = await Util.GetMatrixMembersForRooms(
+            this.bridge.botIntent,
+            rooms,
+            this.bridge.botUserId ? [this.bridge.botUserId] : [],
+        );
         let targetMxid = "";
         let targetDisplayName = "";
 

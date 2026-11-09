@@ -213,9 +213,11 @@ export class Util {
     public static async GetMatrixMembersForRooms(
         intent: Intent,
         channelMxids: string[],
+        excludeUserIds: string[] = [],
     ): Promise<Array<{ mxid: string; displayName: string }>> {
         const client = intent.underlyingClient;
         await intent.ensureRegistered();
+        const excluded = new Set(excludeUserIds);
         const matrixUsers = new Map<string, string>();
         await Promise.all(channelMxids.map(async (chan) => {
             try {
@@ -225,7 +227,7 @@ export class Util {
                         return;
                     }
                     const mxid = member.stateKey;
-                    if (!mxid || mxid.startsWith("@_discord_")) {
+                    if (!mxid || mxid.startsWith("@_discord_") || excluded.has(mxid)) {
                         return;
                     }
                     let displayName = member.content?.displayname;
@@ -235,6 +237,9 @@ export class Util {
                     if (!displayName) {
                         const colonIdx = mxid.indexOf(":");
                         displayName = colonIdx > 1 ? mxid.substring(1, colonIdx) : mxid;
+                    }
+                    if (displayName.includes("[Discord]")) {
+                        return;
                     }
                     matrixUsers.set(mxid, displayName);
                 });
