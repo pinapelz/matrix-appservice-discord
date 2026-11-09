@@ -1400,7 +1400,7 @@ export class DiscordBot {
     }
 
     private async RegisterSlashCommands(): Promise<void> {
-        const appId = this.config.auth?.clientID || this._bot?.user?.id;
+        const appId = this._bot?.user?.id || this.config.auth?.clientID;
         const botToken = this.config.auth?.botToken;
         if (!appId || !botToken || typeof Util.DiscordApiRequest !== "function") {
             return;
@@ -1408,6 +1408,7 @@ export class DiscordBot {
         const commands = [
             {
                 description: "Mention a Matrix user in this bridged channel",
+                dm_permission: false,
                 name: "mention",
                 options: [
                     {
@@ -1436,6 +1437,19 @@ export class DiscordBot {
             log.info("Registered Discord slash commands.");
         } catch (err) {
             log.warn("Failed to register global Discord slash commands:", err);
+        }
+        const guilds = this._bot?.guilds?.cache?.array?.() || [];
+        for (const guild of guilds) {
+            try {
+                await Util.DiscordApiRequest(
+                    "PUT",
+                    `/applications/${appId}/guilds/${guild.id}/commands`,
+                    botToken,
+                    commands,
+                );
+            } catch (err) {
+                log.verbose(`Failed to register guild slash commands for guild ${guild.id}:`, err);
+            }
         }
     }
 
@@ -1470,11 +1484,18 @@ export class DiscordBot {
 
             let rooms: string[] = [];
             if (channelId) {
-                const channel = (this._bot as any)?.channels?.cache?.get(channelId) || { id: channelId };
-                try {
-                    rooms = await this.channelSync.GetRoomIdsFromChannel(channel as Discord.Channel);
-                } catch (err) {
-                    rooms = [];
+                const guild = interaction.guild_id
+                    ? (this._bot as any)?.guilds?.cache?.get(interaction.guild_id)
+                    : undefined;
+                const channel = (this._bot as any)?.channels?.cache?.get(channelId)
+                    || guild?.channels?.resolve?.(channelId)
+                    || { id: channelId };
+                if (!(channel as any).isThreadChannel && (!channel.type || channel.type === "text" || channel.type === 0)) {
+                    try {
+                        rooms = await this.channelSync.GetRoomIdsFromChannel(channel as Discord.Channel);
+                    } catch (err) {
+                        rooms = [];
+                    }
                 }
             }
             if (rooms && rooms.length > 0) {
@@ -1561,6 +1582,10 @@ export class DiscordBot {
             || guild?.channels?.resolve?.(channelId);
         if (!channel) {
             channel = { id: channelId, guild } as unknown as Discord.Channel;
+        }
+        if ((channel as any).isThreadChannel) {
+            await sendInteractionReply("**ERROR:** Threads are not bridged to Matrix.", true);
+            return;
         }
 
         let rooms: string[] = [];

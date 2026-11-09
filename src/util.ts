@@ -221,9 +221,27 @@ export class Util {
         const matrixUsers = new Map<string, string>();
         await Promise.all(channelMxids.map(async (chan) => {
             try {
-                const members = await client.getRoomMembers(chan, undefined, ["leave"]);
+                if (typeof (client as any).getJoinedRoomMembersWithProfiles === "function") {
+                    const profiles = await (client as any).getJoinedRoomMembersWithProfiles(chan);
+                    if (profiles && typeof profiles === "object") {
+                        for (const [mxid, profile] of Object.entries<any>(profiles)) {
+                            if (!mxid || mxid.startsWith("@_discord_") || excluded.has(mxid)) {
+                                continue;
+                            }
+                            const colonIdx = mxid.indexOf(":");
+                            const fallbackName = colonIdx > 1 ? mxid.substring(1, colonIdx) : mxid;
+                            const displayName = profile?.display_name || profile?.displayname || fallbackName;
+                            if (displayName.includes("[Discord]")) {
+                                continue;
+                            }
+                            matrixUsers.set(mxid, displayName);
+                        }
+                        return;
+                    }
+                }
+                const members = await client.getRoomMembers(chan, undefined, ["join"], ["leave", "invite", "ban"]);
                 members.forEach((member) => {
-                    if (member.membership === "invite") {
+                    if (member.membership && member.membership !== "join") {
                         return;
                     }
                     const mxid = member.stateKey;
@@ -244,7 +262,7 @@ export class Util {
                     matrixUsers.set(mxid, displayName);
                 });
             } catch (err) {
-                log.verbose(`Failed to fetch room members for ${chan}`, err);
+                log.warn(`Failed to fetch room members for ${chan}`, err);
             }
         }));
         return Array.from(matrixUsers.entries()).map(([mxid, displayName]) => ({
