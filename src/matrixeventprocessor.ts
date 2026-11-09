@@ -291,7 +291,9 @@ export class MatrixEventProcessor {
         if (event.sender === this.bridge.botUserId) {
             return;
         }
-        const isTeamSpeak = /:([^:]*\.)?tmspk\.net(:[0-9]+)?$/i.test(event.sender);
+        const isTeamSpeak = typeof Util.IsTeamSpeakUser === "function"
+            ? Util.IsTeamSpeakUser(event.sender)
+            : /:([^:]*\.)?tmspk\.net(:[0-9]+)?$/i.test(event.sender);
         if (isTeamSpeak) {
             return;
         }
@@ -823,7 +825,9 @@ export class MatrixEventProcessor {
                 }
             }
         }
-        const isTeamSpeak = /:([^:]*\.)?tmspk\.net(:[0-9]+)?$/i.test(sender);
+        const isTeamSpeak = typeof Util.IsTeamSpeakUser === "function"
+            ? Util.IsTeamSpeakUser(sender)
+            : /:([^:]*\.)?tmspk\.net(:[0-9]+)?$/i.test(sender);
         const platformTag = isTeamSpeak ? " [TeamSpeak]" : " [Matrix]";
         if (!displayName.endsWith(platformTag)) {
             displayName = `${displayName.substring(0, MAX_NAME_LENGTH - platformTag.length)}${platformTag}`;

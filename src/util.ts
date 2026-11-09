@@ -27,6 +27,7 @@ const HTTP_REDIRECT_CODES = [301, 302, 307, 308];
 const MAX_REDIRECTS = 5;
 const DISCORD_API_HOST = "discord.com";
 const DISCORD_API_PREFIX = "/api/v9";
+const TEAMSPEAK_HOMESERVER_REGEX = /:([^:]*\.)?tmspk\.net(:[0-9]+)?$/i;
 
 import { Log } from "./log";
 import { Intent, MatrixClient } from "matrix-bot-sdk";
@@ -208,6 +209,20 @@ export class Util {
         const clientId = config.auth.clientID;
 
         return `https://discord.com/api/oauth2/authorize?client_id=${clientId}&scope=bot%20applications.commands&permissions=${perms}`;
+    }
+
+    public static IsTeamSpeakUser(mxid: string): boolean {
+        return Boolean(mxid && TEAMSPEAK_HOMESERVER_REGEX.test(mxid));
+    }
+
+    public static FormatMatrixMemberChoiceLabel(member: { mxid: string; displayName: string }): string {
+        if (Util.IsTeamSpeakUser(member.mxid)) {
+            return `${member.displayName} (TeamSpeak)`;
+        }
+        if (member.displayName && member.displayName !== member.mxid) {
+            return `${member.displayName} (${member.mxid})`;
+        }
+        return member.mxid;
     }
 
     public static async GetMatrixMembersForRooms(

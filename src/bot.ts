@@ -1508,15 +1508,17 @@ export class DiscordBot {
                     if (!query) {
                         return true;
                     }
+                    const isTs = typeof Util.IsTeamSpeakUser === "function" && Util.IsTeamSpeakUser(m.mxid);
                     return (
                         m.displayName.toLowerCase().includes(query) ||
-                        m.mxid.toLowerCase().includes(query)
+                        (!isTs && m.mxid.toLowerCase().includes(query)) ||
+                        (isTs && "teamspeak".includes(query))
                     );
                 });
                 choices = filtered.slice(0, MAX_AUTOCOMPLETE_CHOICES).map((m) => {
-                    const label = m.displayName && m.displayName !== m.mxid
-                        ? `${m.displayName} (${m.mxid})`
-                        : m.mxid;
+                    const label = typeof Util.FormatMatrixMemberChoiceLabel === "function"
+                        ? Util.FormatMatrixMemberChoiceLabel(m)
+                        : (m.displayName && m.displayName !== m.mxid ? `${m.displayName} (${m.mxid})` : m.mxid);
                     return {
                         name: label.slice(0, MAX_CHOICE_NAME_LENGTH),
                         value: m.mxid,
