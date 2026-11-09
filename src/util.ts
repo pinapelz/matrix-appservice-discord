@@ -128,7 +128,7 @@ export class Util {
         apiPath: string,
         botToken: string,
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        body?: Record<string, any>,
+        body?: Record<string, any> | any[],
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     ): Promise<any> {
         return new Promise((resolve, reject) => {
@@ -207,7 +207,45 @@ export class Util {
 
         const clientId = config.auth.clientID;
 
-        return `https://discord.com/api/oauth2/authorize?client_id=${clientId}&scope=bot&permissions=${perms}`;
+        return `https://discord.com/api/oauth2/authorize?client_id=${clientId}&scope=bot%20applications.commands&permissions=${perms}`;
+    }
+
+    public static async GetMatrixMembersForRooms(
+        intent: Intent,
+        channelMxids: string[],
+    ): Promise<Array<{ mxid: string; displayName: string }>> {
+        const client = intent.underlyingClient;
+        await intent.ensureRegistered();
+        const matrixUsers = new Map<string, string>();
+        await Promise.all(channelMxids.map(async (chan) => {
+            try {
+                const members = await client.getRoomMembers(chan, undefined, ["leave"]);
+                members.forEach((member) => {
+                    if (member.membership === "invite") {
+                        return;
+                    }
+                    const mxid = member.stateKey;
+                    if (!mxid || mxid.startsWith("@_discord_")) {
+                        return;
+                    }
+                    let displayName = member.content?.displayname;
+                    if (!displayName && member.previousContent?.displayname) {
+                        displayName = member.previousContent.displayname;
+                    }
+                    if (!displayName) {
+                        const colonIdx = mxid.indexOf(":");
+                        displayName = colonIdx > 1 ? mxid.substring(1, colonIdx) : mxid;
+                    }
+                    matrixUsers.set(mxid, displayName);
+                });
+            } catch (err) {
+                log.verbose(`Failed to fetch room members for ${chan}`, err);
+            }
+        }));
+        return Array.from(matrixUsers.entries()).map(([mxid, displayName]) => ({
+            displayName,
+            mxid,
+        }));
     }
 
     public static async GetMxidFromName(intent: Intent, name: string, channelMxids: string[]) {

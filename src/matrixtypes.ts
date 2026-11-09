@@ -56,6 +56,10 @@ export interface IMatrixMessage {
     format?: string;
     "m.new_content"?: any; // tslint:disable-line no-any
     "m.relates_to"?: any; // tslint:disable-line no-any
+    "m.mentions"?: {
+        user_ids?: string[];
+        room?: boolean;
+    };
 }
 
 export interface IMatrixMediaInfo {

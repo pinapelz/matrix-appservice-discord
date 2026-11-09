@@ -50,6 +50,15 @@ const GIF_FORMAT = 4;
 const STICKER_SIZE = 160;
 const AUTO_ARCHIVE_MINUTES = 60;
 const SUPPRESS_NOTIFICATIONS_FLAG = 4096;
+const EPHEMERAL_MESSAGE_FLAG = 64;
+const INTERACTION_TYPE_APPLICATION_COMMAND = 2;
+const INTERACTION_TYPE_AUTOCOMPLETE = 4;
+const INTERACTION_CALLBACK_CHANNEL_MESSAGE = 4;
+const INTERACTION_CALLBACK_AUTOCOMPLETE_RESULT = 8;
+const SLASH_COMMAND_OPTION_STRING = 3;
+const MAX_AUTOCOMPLETE_CHOICES = 25;
+const MAX_CHOICE_NAME_LENGTH = 100;
+const MATRIX_TO_LINK = "https://matrix.to/#/";
 
 // how often do we retry to connect on startup
 const INITIAL_FALLOFF_SECONDS = 5;
@@ -570,6 +579,10 @@ export class DiscordBot {
                 if (!packet || !packet.t || !packet.d) {
                     return;
                 }
+                if (packet.t === "INTERACTION_CREATE") {
+                    await this.OnInteractionCreate(packet.d);
+                    return;
+                }
                 const channelsMgr = (client as any).channels;
                 if (!channelsMgr || typeof channelsMgr.add !== "function") {
                     return;
@@ -617,6 +630,8 @@ export class DiscordBot {
         client.on("warn", (msg) => { jsLog.warn(msg); });
         log.info("Discord bot client logged in.");
         this._bot = client;
+
+        await this.RegisterSlashCommands();
 
         if (!this.config.bridge.disablePresence) {
             if (!this.config.bridge.presenceInterval) {
@@ -1382,6 +1397,319 @@ export class DiscordBot {
         } catch (err) {
             log.warn(`Failed to send thread unsupported notice to Discord thread ${threadId}:`, err);
         }
+    }
+
+    private async RegisterSlashCommands(): Promise<void> {
+        const appId = this.config.auth?.clientID || this._bot?.user?.id;
+        const botToken = this.config.auth?.botToken;
+        if (!appId || !botToken || typeof Util.DiscordApiRequest !== "function") {
+            return;
+        }
+        const commands = [
+            {
+                description: "Mention a Matrix user in this bridged channel",
+                name: "mention",
+                options: [
+                    {
+                        autocomplete: true,
+                        description: "The Matrix user to mention (display name or @user:server)",
+                        name: "user",
+                        required: true,
+                        type: SLASH_COMMAND_OPTION_STRING,
+                    },
+                    {
+                        description: "Optional message to send along with the mention",
+                        name: "message",
+                        required: false,
+                        type: SLASH_COMMAND_OPTION_STRING,
+                    },
+                ],
+            },
+        ];
+        try {
+            await Util.DiscordApiRequest(
+                "PUT",
+                `/applications/${appId}/commands`,
+                botToken,
+                commands,
+            );
+            log.info("Registered Discord slash commands.");
+        } catch (err) {
+            log.warn("Failed to register global Discord slash commands:", err);
+        }
+    }
+
+    private async OnInteractionCreate(interaction: any): Promise<void> {
+        if (!interaction || !interaction.id || !interaction.token) {
+            return;
+        }
+        const cmdName = interaction.data?.name;
+        if (cmdName !== "mention") {
+            return;
+        }
+        if (interaction.type === INTERACTION_TYPE_AUTOCOMPLETE) {
+            await this.HandleMentionAutocomplete(interaction);
+            return;
+        }
+        if (interaction.type === INTERACTION_TYPE_APPLICATION_COMMAND) {
+            await this.HandleMentionCommand(interaction);
+        }
+    }
+
+    private async HandleMentionAutocomplete(interaction: any): Promise<void> {
+        const botToken = this.config.auth?.botToken;
+        if (!botToken || typeof Util.DiscordApiRequest !== "function") {
+            return;
+        }
+        let choices: Array<{ name: string; value: string }> = [];
+        try {
+            const channelId = interaction.channel_id;
+            const options: any[] = Array.isArray(interaction.data?.options) ? interaction.data.options : [];
+            const userOpt = options.find((o) => o.name === "user");
+            const query = String(userOpt?.value || "").trim().toLowerCase();
+
+            let rooms: string[] = [];
+            if (channelId) {
+                const channel = (this._bot as any)?.channels?.cache?.get(channelId) || { id: channelId };
+                try {
+                    rooms = await this.channelSync.GetRoomIdsFromChannel(channel as Discord.Channel);
+                } catch (err) {
+                    rooms = [];
+                }
+            }
+            if (rooms && rooms.length > 0) {
+                const members = await Util.GetMatrixMembersForRooms(this.bridge.botIntent, rooms);
+                const filtered = members.filter((m) => {
+                    if (!query) {
+                        return true;
+                    }
+                    return (
+                        m.displayName.toLowerCase().includes(query) ||
+                        m.mxid.toLowerCase().includes(query)
+                    );
+                });
+                choices = filtered.slice(0, MAX_AUTOCOMPLETE_CHOICES).map((m) => {
+                    const label = m.displayName && m.displayName !== m.mxid
+                        ? `${m.displayName} (${m.mxid})`
+                        : m.mxid;
+                    return {
+                        name: label.slice(0, MAX_CHOICE_NAME_LENGTH),
+                        value: m.mxid,
+                    };
+                });
+            }
+        } catch (err) {
+            log.warn("Failed to build autocomplete choices for /mention:", err);
+        }
+
+        try {
+            await Util.DiscordApiRequest(
+                "POST",
+                `/interactions/${interaction.id}/${interaction.token}/callback`,
+                botToken,
+                {
+                    data: { choices },
+                    type: INTERACTION_CALLBACK_AUTOCOMPLETE_RESULT,
+                },
+            );
+        } catch (err) {
+            log.warn("Failed to respond to /mention autocomplete interaction:", err);
+        }
+    }
+
+    private async HandleMentionCommand(interaction: any): Promise<void> {
+        const botToken = this.config.auth?.botToken;
+        const sendInteractionReply = async (content: string, ephemeral: boolean = false, allowedUserIds: string[] = []) => {
+            if (!botToken || typeof Util.DiscordApiRequest !== "function") {
+                return;
+            }
+            const data: Record<string, any> = {
+                allowed_mentions: {
+                    parse: [],
+                    users: allowedUserIds,
+                },
+                content,
+            };
+            if (ephemeral) {
+                data.flags = EPHEMERAL_MESSAGE_FLAG;
+            }
+            await Util.DiscordApiRequest(
+                "POST",
+                `/interactions/${interaction.id}/${interaction.token}/callback`,
+                botToken,
+                {
+                    data,
+                    type: INTERACTION_CALLBACK_CHANNEL_MESSAGE,
+                },
+            );
+        };
+
+        const channelId = interaction.channel_id;
+        const guildId = interaction.guild_id;
+        const senderUser = interaction.member?.user || interaction.user;
+        if (!channelId || !senderUser?.id) {
+            await sendInteractionReply("**ERROR:** Could not determine channel or user for mention.", true);
+            return;
+        }
+
+        const guild = guildId ? (this._bot as any)?.guilds?.cache?.get(guildId) : undefined;
+        let channel: Discord.Channel | undefined = (this._bot as any)?.channels?.cache?.get(channelId)
+            || guild?.channels?.resolve?.(channelId);
+        if (!channel) {
+            channel = { id: channelId, guild } as unknown as Discord.Channel;
+        }
+
+        let rooms: string[] = [];
+        try {
+            rooms = await this.channelSync.GetRoomIdsFromChannel(channel);
+        } catch (err) {
+            rooms = [];
+        }
+        if (!rooms || rooms.length === 0) {
+            await sendInteractionReply("**ERROR:** This channel is not bridged to a Matrix room.", true);
+            return;
+        }
+
+        const options: any[] = Array.isArray(interaction.data?.options) ? interaction.data.options : [];
+        const rawUser = String(options.find((o) => o.name === "user")?.value || "").trim();
+        const rawMessage = String(options.find((o) => o.name === "message")?.value || "").trim();
+        if (!rawUser) {
+            await sendInteractionReply("**ERROR:** Please specify a Matrix user to mention.", true);
+            return;
+        }
+
+        const members = await Util.GetMatrixMembersForRooms(this.bridge.botIntent, rooms);
+        let targetMxid = "";
+        let targetDisplayName = "";
+
+        const exactMember = members.find(
+            (m) => m.mxid.toLowerCase() === rawUser.toLowerCase() ||
+                   m.displayName.toLowerCase() === rawUser.toLowerCase(),
+        );
+        if (exactMember) {
+            targetMxid = exactMember.mxid;
+            targetDisplayName = exactMember.displayName;
+        } else if (rawUser.startsWith("@") && rawUser.includes(":")) {
+            targetMxid = rawUser;
+            const colonIdx = rawUser.indexOf(":");
+            targetDisplayName = colonIdx > 1 ? rawUser.substring(1, colonIdx) : rawUser;
+        } else {
+            try {
+                targetMxid = await Util.GetMxidFromName(this.bridge.botIntent, rawUser, rooms);
+                const resolvedMember = members.find((m) => m.mxid === targetMxid);
+                const colonIdx = targetMxid.indexOf(":");
+                targetDisplayName = resolvedMember?.displayName
+                    || (colonIdx > 1 ? targetMxid.substring(1, colonIdx) : targetMxid);
+            } catch (err) {
+                await sendInteractionReply(`**ERROR:** ${err.message || "Could not find Matrix user."}`, true);
+                return;
+            }
+        }
+
+        // Send the public message on Discord on behalf of the user:
+        // Format: "@user: message @mentioneduser" (or "@user: @mentioneduser" if no message)
+        const discordMentionTarget = targetDisplayName.startsWith("@")
+            ? targetDisplayName
+            : `@${targetDisplayName}`;
+        const discordContent = rawMessage
+            ? `<@${senderUser.id}>: ${rawMessage} ${discordMentionTarget}`
+            : `<@${senderUser.id}>: ${discordMentionTarget}`;
+
+        try {
+            await sendInteractionReply(discordContent, false, [senderUser.id]);
+        } catch (err) {
+            log.warn("Failed to send interaction callback to Discord:", err);
+        }
+
+        // Fetch the original interaction response message ID so edits/deletions/replies map properly
+        let discordMsgId = interaction.id;
+        const appId = this.config.auth?.clientID || this._bot?.user?.id;
+        if (appId && botToken && typeof Util.DiscordApiRequest === "function") {
+            try {
+                const origMsg = await Util.DiscordApiRequest(
+                    "GET",
+                    `/webhooks/${appId}/${interaction.token}/messages/@original`,
+                    botToken,
+                );
+                if (origMsg?.id) {
+                    discordMsgId = origMsg.id;
+                    this.sentMessages.push(discordMsgId);
+                }
+            } catch (err) {
+                log.verbose("Could not fetch @original interaction response message:", err);
+            }
+        }
+
+        // Build Matrix message content using standard Matrix mention pill & m.mentions
+        const pillHtml = `<a href="${MATRIX_TO_LINK}${escapeHtml(targetMxid)}">${escapeHtml(targetDisplayName)}</a>`;
+        const plainMention = `${targetDisplayName} (${targetMxid})`;
+
+        let body = plainMention;
+        let formattedBody = pillHtml;
+        if (rawMessage) {
+            const fakeMsg = {
+                author: {
+                    bot: Boolean(senderUser.bot),
+                    id: senderUser.id,
+                    username: senderUser.username,
+                },
+                channel,
+                content: rawMessage,
+                embeds: [],
+                guild,
+                id: discordMsgId,
+                member: guild?.members?.resolve?.(senderUser.id) || undefined,
+            } as unknown as Discord.Message;
+            const parsed = await this.discordMsgProcessor.FormatMessage(fakeMsg);
+            body = `${parsed.body} ${plainMention}`;
+            formattedBody = `${parsed.formattedBody} ${pillHtml}`;
+        }
+
+        const authorObj = (guild?.members?.resolve?.(senderUser.id))
+            || ({
+                bot: Boolean(senderUser.bot),
+                discriminator: senderUser.discriminator || "0000",
+                id: senderUser.id,
+                username: senderUser.username || senderUser.id,
+            } as unknown as Discord.User);
+        if (this.userSync && typeof this.userSync.OnUpdateUser === "function") {
+            try {
+                await this.userSync.OnUpdateUser(authorObj as Discord.User, false);
+            } catch (err) {
+                log.verbose("Could not sync user profile before /mention:", err);
+            }
+        }
+        const intent = this.GetIntentFromDiscordMember(authorObj);
+
+        await Util.AsyncForEach(rooms, async (room) => {
+            const sendContent: IMatrixMessage = {
+                body,
+                format: "org.matrix.custom.html",
+                formatted_body: formattedBody,
+                "m.mentions": {
+                    user_ids: [targetMxid],
+                },
+                msgtype: senderUser.bot ? "m.notice" : "m.text",
+            };
+            const recordMsg = {
+                channel: { id: channelId },
+                guild: guildId ? { id: guildId } : undefined,
+                id: discordMsgId,
+            } as unknown as Discord.Message;
+            const trySend = async () => intent.sendEvent(room, sendContent);
+            try {
+                const eventId = await trySend();
+                await this.RecordDiscordEventSentToMatrix(recordMsg, room, eventId, intent.userId);
+            } catch (e) {
+                if (e.errcode !== "M_FORBIDDEN" && e.errcode !== "M_GUEST_ACCESS_FORBIDDEN") {
+                    log.error("Failed to send /mention message into Matrix room.", e);
+                    return;
+                }
+                await this.userSync.JoinRoom(authorObj, room);
+                const eventId = await trySend();
+                await this.RecordDiscordEventSentToMatrix(recordMsg, room, eventId, intent.userId);
+            }
+        });
     }
 
     private async ResolveDiscordMessageRelatesTo(msg: Discord.Message, room: string): Promise<any | undefined> {
